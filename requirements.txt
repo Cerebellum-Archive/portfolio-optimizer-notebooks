@@ -1,0 +1,5 @@
+matplotlib==3.10.3
+numpy==2.3.0
+pandas==2.3.0
+Riskfolio_Lib==6.2.2
+xarray==2025.3.1
