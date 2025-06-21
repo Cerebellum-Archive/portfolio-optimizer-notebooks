@@ -4,6 +4,8 @@ import riskfolio as rp
 import xarray as xr
 import datetime
 import matplotlib.pyplot as plt
+from matplotlib.ticker import PercentFormatter
+import plotly.graph_objects as go
 
 
 class RiskfolioOptimizer:
@@ -75,15 +77,78 @@ class RiskfolioOptimizer:
             plt.show()
 
 
+    def plot_weights_plotly(self):
+        if self.w is not None:
+            weights = self.w.sort_values(by='weights')
+            tickers = weights.index
+            values = weights['weights'].values.flatten()
+
+            colors = np.where(values >= 0, '#1f77b4', '#ff7f0e')
+            text_positions = ['middle right' if v >= 0 else 'middle left' for v in values]
+            text_labels = [f"{v:.1%}  {ticker}" if v >= 0 else f"{v:.1%}  {ticker}"
+                           for v, ticker in zip(values, tickers)]
+
+            fig = go.Figure()
+
+            # Lollipop sticks
+            for val, i in zip(values, range(len(tickers))):
+                fig.add_trace(go.Scatter(
+                    x=[0, val], y=[i, i],
+                    mode='lines',
+                    line=dict(color='lightgray', width=2),
+                    showlegend=False,
+                    hoverinfo='skip'
+                ))
+
+            # Lollipop heads
+            fig.add_trace(go.Scatter(
+                x=values,
+                y=list(range(len(tickers))),
+                mode='markers+text',
+                marker=dict(size=10, color=colors),
+                text=text_labels,
+                textposition=text_positions,
+                textfont=dict(size=10, color=colors),
+                hovertemplate='%{text}<extra></extra>',
+                showlegend=False
+            ))
+
+            # Layout settings
+            fig.update_layout(
+                title=dict(
+                    text='Optimized Portfolio Weights',
+                    x=0.5, xanchor='center',
+                    font=dict(size=16, family='Arial', color='black')
+                ),
+                xaxis_title='Weight',
+                xaxis_tickformat='.0%',
+                plot_bgcolor='white',
+                height=max(400, 20 * len(weights)),
+                margin=dict(l=120, r=120, t=60, b=40)
+            )
+
+            fig.update_yaxes(showticklabels=False, showgrid=False, zeroline=False)
+            fig.update_xaxes(showgrid=False, zeroline=True, zerolinecolor='black')
+
+            fig.show()
+
+
+
     def plot_frontier(self, points=30, current_weights=None):
         if self.port is not None:
             # Generate efficient frontier
             frontier = self.port.efficient_frontier(points=points)
 
             # Plot optimized portfolio
-            ax = rp.plot_frontier(w_frontier=frontier, mu=self.mu, cov=self.port.cov,
-                                  returns=self.port.returns, w=self.w,
-                                  label='Optimized', marker='*', s=16, c='r')
+            ax = rp.plot_frontier(w_frontier=frontier,
+                                  mu=self.mu,
+                                  cov=self.port.cov,
+                                  returns=self.port.returns,
+                                  w=self.w,
+                                  label='Optimized',
+                                  marker='*',
+                                  s=16,
+                                  c='r')
 
             # Plot current portfolio if provided
             if current_weights is not None:
@@ -93,7 +158,9 @@ class RiskfolioOptimizer:
                 ax.scatter(port_risk, port_return, marker='o', s=16, color='red', label='Current Position')
 
             ax.legend()
-            plt.tight_layout()
+            fig = ax.get_figure()
+            fig.set_constrained_layout(True)
+
             plt.show()
 
 
