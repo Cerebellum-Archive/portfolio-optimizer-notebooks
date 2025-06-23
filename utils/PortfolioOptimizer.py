@@ -4,7 +4,6 @@ import riskfolio as rp
 import xarray as xr
 import datetime
 import matplotlib.pyplot as plt
-from matplotlib.ticker import PercentFormatter
 import plotly.graph_objects as go
 
 
@@ -129,9 +128,7 @@ class RiskfolioOptimizer:
 
             fig.update_yaxes(showticklabels=False, showgrid=False, zeroline=False)
             fig.update_xaxes(showgrid=False, zeroline=True, zerolinecolor='black')
-
-            fig.show()
-
+            fig.show(config={'responsive': True})
 
 
     def plot_frontier(self, points=30, current_weights=None):
@@ -157,7 +154,6 @@ class RiskfolioOptimizer:
                 port_risk = np.sqrt(np.dot(current_weights.T, np.dot(self.port.cov.values, current_weights)))
                 ax.scatter(port_risk, port_return, marker='o', s=16, color='red', label='Current Position')
 
-            ax.legend()
             fig = ax.get_figure()
             fig.set_constrained_layout(True)
 
