@@ -1,5 +1,7 @@
-matplotlib==3.10.3
-numpy==2.3.0
-pandas==2.3.0
-Riskfolio_Lib==6.2.2
-xarray==2025.3.1
+xarray==2024.3.0
+zarr==2.16.1
+gcsfs==2024.3.1
+matplotlib
+seaborn
+plotly
+Riskfolio-Lib

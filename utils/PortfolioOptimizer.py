@@ -2,7 +2,6 @@ import pandas as pd
 import numpy as np
 import riskfolio as rp
 import xarray as xr
-import datetime
 import matplotlib.pyplot as plt
 import plotly.graph_objects as go
 
