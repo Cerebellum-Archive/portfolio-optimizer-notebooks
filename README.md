@@ -2,7 +2,7 @@
 
 [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/drewtilley/portfolio-optimizer-notebooks/blob/main/notebooks/PortfolioOptimizer.ipynb)
 
-This repository contains an interactive demonstration of a factor-based portfolio optimization engine using RiskModels data, Riskfolio-Lib, and custom factor covariance inputs.
+This repository contains an interactive demonstration of a factor-based portfolio optimization engine using Blue Water Macro data, Riskfolio-Lib, and custom factor covariance inputs.
 
 It includes a Jupyter/Colab-friendly notebook along with supporting utilities to showcase:
 
@@ -32,7 +32,7 @@ It includes a Jupyter/Colab-friendly notebook along with supporting utilities to
     │
     ├── data/ # Optional placeholder for local data
     ├── requirements.txt # Minimal dependencies (Colab-compatible)
-    ├── LICENSE # MIT License
+    ├── LICENSE
     └── README.md
     
 
@@ -63,3 +63,35 @@ pip install -r requirements.txt
 
 # Launch Jupyter
 jupyter notebook
+
+---
+
+## Data Access
+
+This demo reads a small public sample dataset stored in a public Google Cloud bucket via gcsfs.
+The notebook handles this automatically — no credentials required.
+
+If you'd like to utilize Blue Water Macro proprietary datasets contact us at **[support@riskmodels.net](mailto:support@riskmodels.net)**
+
+If you'd like to use local Zarr files, csv, or other datasets modify the data_path inside the notebook accordingly.
+
+---
+
+## Dependencies
+
+    xarray
+    zarr
+    gcsfs
+    riskfolio-lib
+    matplotlib, seaborn, plotly
+
+Fully compatible with Python 3.11 and Google Colab
+
+---
+
+## License
+
+This project is licensed under the MIT License.
+See LICENSE for details.
+
+---
