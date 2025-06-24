@@ -14,7 +14,7 @@ It includes a Jupyter/Colab-friendly notebook along with supporting utilities to
 ## Key Features
 
 - **Custom Risk Models**: Use market, sector, and residual decomposition for returns.
-- **Flexible Constraints**: Apply sector neutrality, long/short conditions, and le limits.
+- **Flexible Constraints**: Apply sector neutrality, long/short conditions, and leverage limits.
 - **Factor-based Optimization**: Build portfolios on top of factor betas and factor covariance matrices.
 - **Visualization Tools**: Plot optimal weights and frontier with Plotly and Matplotlib.
 
@@ -34,7 +34,6 @@ It includes a Jupyter/Colab-friendly notebook along with supporting utilities to
     ├── requirements.txt # Minimal dependencies (Colab-compatible)
     ├── LICENSE
     └── README.md
-    
 
 ---
 
@@ -63,6 +62,7 @@ pip install -r requirements.txt
 
 # Launch Jupyter
 jupyter notebook
+```
 
 ---
 
@@ -85,7 +85,7 @@ If you'd like to use local Zarr files, csv, or other datasets modify the data_pa
     riskfolio-lib
     matplotlib, seaborn, plotly
 
-Fully compatible with Python 3.11 and Google Colab
+Compatible with Python 3.11 and Google Colab
 
 ---
 
