@@ -54,6 +54,9 @@ class RiskfolioOptimizer:
         self.port = None    # Riskfolio portfolio object
 
 
+    def validate_config(self):
+        raise NotImplementedError("Subclasses must implement the validate_config() method.")
+
     def optimize(self):
         raise NotImplementedError("Subclasses must implement the optimize() method.")
 
@@ -162,6 +165,7 @@ class RiskfolioOptimizer:
 class ClassicOptimizer(RiskfolioOptimizer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self.validate_config()
 
     def validate_config(self):
         # Check that returns are provided
@@ -188,10 +192,11 @@ class ClassicOptimizer(RiskfolioOptimizer):
             # Set default config
             self.optimizer_config = {}
             self.optimizer_config.setdefault("model", "Classic")
-            self.optimizer_config.setdefault("rm", "MV")     # Risk measure: MV = variance
-            self.optimizer_config.setdefault("rf", 0)        # Risk-free rate
-            self.optimizer_config.setdefault("l", 0)         # Risk aversion
-            self.optimizer_config.setdefault("hist", True)   # Use historical data
+            self.optimizer_config.setdefault("rm", "MV")        # Risk measure: MV = variance
+            self.optimizer_config.setdefault("rf", 0)           # Risk-free rate
+            self.optimizer_config.setdefault("l", 0)            # Risk aversion
+            self.optimizer_config.setdefault("hist", True)      # Use historical data
+            self.optimizer_config.setdefault("obj", "Sharpe")   # Maximize Sharpe
 
 
     def optimize(self, returns_col:str='residual_return', LongOnly=True) -> None:
@@ -220,6 +225,8 @@ class ClassicOptimizer(RiskfolioOptimizer):
 class FactorModelOptimizer(RiskfolioOptimizer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self.validate_config()
+
         self.B = None  # factor exposure matrix
         self.F = None  # factor covariance matrix
         self.D = None  # residual matrix
@@ -257,10 +264,11 @@ class FactorModelOptimizer(RiskfolioOptimizer):
             # Set default config
             self.optimizer_config = {}
             self.optimizer_config.setdefault("model", "Classic")
-            self.optimizer_config.setdefault("rm", "MV")     # Risk measure: MV = variance
-            self.optimizer_config.setdefault("rf", 0)        # Risk-free rate
-            self.optimizer_config.setdefault("l", 0)         # Risk aversion
-            self.optimizer_config.setdefault("hist", False)  # Estimate from market returns
+            self.optimizer_config.setdefault("rm", "MV")        # Risk measure: MV = variance
+            self.optimizer_config.setdefault("rf", 0)           # Risk-free rate
+            self.optimizer_config.setdefault("l", 0)            # Risk aversion
+            self.optimizer_config.setdefault("hist", False)     # Estimate from market returns
+            self.optimizer_config.setdefault("obj", "Sharpe")   # Maximize Sharpe
 
 
     def calculate_fm_cov(self, n_window:int=None, end_window:pd.Timestamp=None, return_sigma=False):
