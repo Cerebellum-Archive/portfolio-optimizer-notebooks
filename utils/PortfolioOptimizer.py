@@ -39,6 +39,7 @@ class RiskfolioOptimizer:
         # Convert xarray dataset to DataFrame
         df = daily_ds.to_dataframe().reset_index()
         df.set_index(["date", "ticker"], inplace=True)
+        df.sort_index(level=['date', 'ticker'], inplace=True)
 
         # Convert returns/variances from percentage to decimal
         for col in df.columns:
