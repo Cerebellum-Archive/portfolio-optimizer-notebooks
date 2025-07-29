@@ -35,39 +35,84 @@ class RiskfolioOptimizer:
         self.start_date = daily_ds.coords["date"].values[0]
         self.end_date = daily_ds.coords["date"].values[-1]
         self.tickers = list(daily_ds.coords["ticker"].values)
-        self.optimizer_config = optimizer_config
-        self.input_config = optimizer_config
+        self._config = optimizer_config
+        if optimizer_config is not None:
+            self.input_config = optimizer_config.copy()
+        else:
+            self.input_config = None
 
         # Convert xarray dataset to DataFrame
-        df = daily_ds.to_dataframe().reset_index()
+        self.bw_daily_df = self._convert_bw_ds_to_df(daily_ds)
+
+        # Placeholders for optimization components
+        self.mu_ = None                    # Expected returns
+        self.sigma_ = None                 # Covariance matrix
+        self.weights_ = None               # Optimized weights
+        self.sharpe_ = None                # Portfolio in-sample Sharpe
+        self.port_vol_ = None              # Portfolio volatility
+        self.port_return_ = None           # in-sample returns
+        self.predicted_return_ = None      # out-of-sample returns
+        self.port = None                   # Riskfolio portfolio object
+
+
+    def configure_optimizer(self):
+        raise NotImplementedError("Subclasses must implement the configure_optimizer() method.")
+
+    def fit(self):
+        raise NotImplementedError("Subclasses must implement the fit() method.")
+
+    def predict(self, returns_next: xr.Dataset) -> float:
+        """
+        Predicts realized portfolio return using actual asset returns from the next day.
+        These are multiplied by the optimized weights (self.weights_).
+
+        Parameters
+        ----------
+        returns_next : xr.Dataset
+            Slice of the dataset with one date and asset-level returns.
+            Expected to be in percentage units (0.52 = 0.52%).
+        """
+        returns_var = self._config.get("returns_var", "return")
+
+        # Convert to Series (e.g. ticker → return)
+        returns_next = returns_next[returns_var].to_series() * 0.01
+        returns_next.index.name = 'ticker'
+
+        # Align with optimized weights
+        returns_next = returns_next.reindex(self.weights_.index)
+
+        # Predict portfolio return
+        self.predicted_return_ = (self.weights_.T @ returns_next).values.item()
+        return self.predicted_return_
+
+
+    def _convert_bw_ds_to_df(self, ds:xr.Dataset) -> pd.DataFrame:
+        # Convert xarray dataset to DataFrame
+        df = ds.to_dataframe().reset_index()
         df.set_index(["date", "ticker"], inplace=True)
         df.sort_index(level=['date', 'ticker'], inplace=True)
 
         # Convert returns/variances from percentage to decimal
         for col in df.columns:
             if "return" in col.lower() or "variance" in col.lower():
-                df[col] = df[col] / 100.0
+                df[col] = df[col] * 0.01
+        return df
 
-        self.bw_daily_df = df
-
-        # Placeholders for optimization components
-        self.mu = None      # Expected returns
-        self.sigma = None   # Covariance matrix
-        self.w = None       # Optimized weights
-        self.port = None    # Riskfolio portfolio object
-
-
-    def configure_optimizer(self):
-        raise NotImplementedError("Subclasses must implement the configure_optimizer() method.")
-
-    def optimize(self):
-        raise NotImplementedError("Subclasses must implement the optimize() method.")
+    def _calculate_in_sample_sharpe(self) -> float:
+        # Calculate portfolio in-sample Sharpe and volatility
+        self.port_return_ = (self.weights_.T @ self.mu_).values.item()
+        self.port_vol_ = (np.sqrt(self.weights_.T @ self.sigma_ @ self.weights_)
+                          .values.item()
+                          )
+        rf = self._config.get('rf', 0)
+        self.sharpe_ = (self.port_return_ - rf) / self.port_vol_
+        return self.sharpe_
 
     def plot_weights(self):
-        if self.w is not None:
-            has_negative = (self.w < 0).any().item()
+        if self.weights_ is not None:
+            has_negative = (self.weights_ < 0).any().item()
 
-        weights = self.w.iloc[:,0] # TODO: convert type try to clean up later
+        weights = self.weights_.iloc[:,0] # TODO: convert type try to clean up later
         if has_negative:
             weights.sort_values(ascending=True).plot(kind='barh', title='Optimized Portfolio Weights')
             plt.xlabel("Weight")
@@ -82,8 +127,8 @@ class RiskfolioOptimizer:
 
 
     def plot_weights_plotly(self):
-        if self.w is not None:
-            weights = self.w.sort_values(by='weights')
+        if self.weights_ is not None:
+            weights = self.weights_.sort_values(by='weights')
             tickers = weights.index
             values = weights['weights'].values.flatten()
 
@@ -143,10 +188,10 @@ class RiskfolioOptimizer:
 
             # Plot optimized portfolio
             ax = rp.plot_frontier(w_frontier=frontier,
-                                  mu=self.mu,
+                                  mu=self.mu_,
                                   cov=self.port.cov,
                                   returns=self.port.returns,
-                                  w=self.w,
+                                  w=self.weights_,
                                   label='Optimized',
                                   marker='*',
                                   s=16,
@@ -154,8 +199,8 @@ class RiskfolioOptimizer:
 
             # Plot current portfolio if provided
             if current_weights is not None:
-                current_weights = current_weights.reindex(self.w.index).fillna(0)
-                port_return = np.dot(current_weights, self.mu.values.flatten())
+                current_weights = current_weights.reindex(self.weights_.index).fillna(0)
+                port_return = np.dot(current_weights, self.mu_.values.flatten())
                 port_risk = np.sqrt(np.dot(current_weights.T, np.dot(self.port.cov.values, current_weights)))
                 ax.scatter(port_risk, port_return, marker='o', s=16, color='red', label='Current Position')
 
@@ -170,9 +215,6 @@ class ClassicOptimizer(RiskfolioOptimizer):
         super().__init__(*args, **kwargs)
         self.configure_optimizer()
 
-        self.returns = None
-        self.scaled_mu = None
-
     def configure_optimizer(self):
         # Check that returns are provided
         if self.bw_daily_df is None or self.bw_daily_df.empty:
@@ -182,21 +224,21 @@ class ClassicOptimizer(RiskfolioOptimizer):
         if self.bw_daily_df.isnull().any().any():
             raise ValueError("bw_daily_df contains NaN values.")
 
-        if self.optimizer_config is not None:
+        if self._config is not None:
             # Check model
-            if self.optimizer_config.get('model') != 'Classic':
+            if self._config.get('model') != 'Classic':
                 msg = ("ClassicOptimizer requires optimizer_config['model'] == 'Classic'.")
                 raise ValueError(msg)
 
             # Check config keys
             valid_objs = {"Sharpe", "MinRisk", "MaxRet", "Utility"}
-            obj = self.optimizer_config.get("obj", "Sharpe")
+            obj = self._config.get("obj", "Sharpe")
             if obj not in valid_objs:
                 raise ValueError(f"Invalid objective '{obj}'. Must be one of {valid_objs}.")
 
         else:
             # Set default config
-            self.optimizer_config = {
+            self._config = {
                 "model": "Classic",          # Classic Markowitz optimizer
                 "rm": "MV",                  # Risk Measure: MV = Variance
                 "rf": 0,                     # Risk-free rate (in decimal form)
@@ -214,58 +256,82 @@ class ClassicOptimizer(RiskfolioOptimizer):
                 "mu_scalar": None            # Scalar applied to expected returns [0,1]
             }
 
-        returns_var = self.optimizer_config.pop('returns_var')
-        self.returns = self.bw_daily_df[returns_var].unstack(level='ticker')
+        if self.input_config is None:
+            self.input_config = self._config.copy()
+
+        # Load historical returns into optimizer
+        returns_var = self._config.pop('returns_var')
+        returns = self.bw_daily_df[returns_var].unstack(level='ticker')
 
         # Create portfolio
-        self.port = rp.Portfolio(returns=self.returns)
+        self.port = rp.Portfolio(returns=returns)
 
         # Determine mean/covariance method for stats
-        method_mu = self.optimizer_config.pop('method_mu', 'hist')
-        method_cov = self.optimizer_config.pop('method_cov', 'hist')
+        method_mu = self._config.pop('method_mu', 'hist')
+        method_cov = self._config.pop('method_cov', 'hist')
 
         # Handle EWMA case with fallback halflife
         if method_mu == 'ewma' or method_cov == 'ewma':
-            halflife = self.optimizer_config.pop('halflife', None)
+            if self._config.get('hist', None):
+                warnings.warn(
+                    "The optimizer configuration specified EWMA."
+                    "Preventing accidental override: setting 'hist' to False."
+                )
+                self._config['hist'] = False
+                self.input_config['hist'] = False
+
+            halflife = self._config.pop('halflife', None)
             if halflife is None:
                 halflife = 30  # Default fallback
                 warnings.warn(
                     "Optimizer config did not specify a halflife for EWMA. "
                     "Defaulting to halflife=30."
                 )
-            mu = self.returns.ewm(halflife=halflife).mean().iloc[-1]
-            cov = self.returns.ewm(halflife=halflife).cov().iloc[-self.returns.shape[1]:]
+            mu = returns.ewm(halflife=halflife).mean().iloc[-1]
+            cov = returns.ewm(halflife=halflife).cov().iloc[-returns.shape[1]:]
 
             self.port.mu = mu
             self.port.cov = cov.droplevel('date')
 
         else:
             # Apply simple 'hist'
+            self._config.pop('halflife', None) # Remove 'halflife'
             self.port.assets_stats(method_mu=method_mu, method_cov=method_cov)
 
-    def optimize(self):
-        """Calculates optimized weights from historical returns."""
+
+    def fit(self):
+        """
+        Calculates optimized weights from historical returns.
+        """
 
         # Assign sigma, mu used for optimization
-        self.sigma = self.port.cov
-        self.mu = self.port.mu
+        self.sigma_ = self.port.cov
 
         # Scaled mu if not confident in estimate
-        mu_scalar = self.optimizer_config.pop('mu_scalar', None)
+        mu_scalar = self._config.pop('mu_scalar', None)
         if mu_scalar is not None:
-            self.scaled_mu = self.port.mu * mu_scalar
-            self.port.mu = self.scaled_mu
+            scaled_mu = self.port.mu * mu_scalar
+            self.port.mu = scaled_mu
+            self.mu_ = self.port.mu
+        else:
+            self.mu_ = self.port.mu
+        self.mu_ = self.mu_.squeeze()
+        self.mu_.index.name = 'ticker'
 
         # Assign portfolio leverage and long/short budget
-        self.port.sht = self.optimizer_config.pop('sht', False)
-        self.port.budget = self.optimizer_config.pop('budget', 1.0)
-        self.port.uppersht = self.optimizer_config.pop('uppersht', 1.0)
-        self.port.upperlng = self.optimizer_config.pop('upperlng', 1.0)
+        self.port.sht = self._config.pop('sht', False)
+        self.port.budget = self._config.pop('budget', 1.0)
+        self.port.uppersht = self._config.pop('uppersht', 1.0)
+        self.port.upperlng = self._config.pop('upperlng', 1.0)
 
+        # Run optimization
+        self.weights_ = self.port.optimization(**self._config)
 
-        self.w = self.port.optimization(**self.optimizer_config)
+        # Reset optimizer_config to input
+        self._config = self.input_config
 
-        return self.w
+        # Calculate portfolio in-sample Sharpe and volatility
+        self._calculate_in_sample_sharpe()
 
 
 class FactorModelOptimizer(RiskfolioOptimizer):
@@ -276,11 +342,8 @@ class FactorModelOptimizer(RiskfolioOptimizer):
         self.B = None  # factor exposure matrix
         self.F = None  # factor covariance matrix
         self.D = None  # residual matrix
-        self.f = None  # factor returns vector
+        self.f = None  # expected factor returns vector
         self.f_scaled = None  # scaled factor returns vector
-
-        self.returns = None  # gross returns used for plotting
-        self.factor_returns = None  # factor returns
 
 
     def configure_optimizer(self):
@@ -292,24 +355,24 @@ class FactorModelOptimizer(RiskfolioOptimizer):
         if self.bw_daily_df.isnull().any().any():
             raise ValueError("bw_daily_df contains NaN values.")
 
-        if self.optimizer_config is not None:
+        if self._config is not None:
             # Check model and hist
-            if self.optimizer_config.get('model') != 'Classic' or self.optimizer_config.get('hist') is True:
+            if self._config.get('model') != 'Classic' or self._config.get('hist') is True:
                 msg = ("FactorModelOptimizer requires optimizer_config['model'] == 'Classic' "
                        "and optimizer_config['hist'] == False\n"
                        "FactorModelOptimizer precomputes factor covariance matrix (sigma).\n"
-                       "FactorModelOptimizer model=='Classic' to use precomputed sigma.")
+                       "FactorModelOptimizer model=='Classic' is required to use precomputed sigma.")
                 raise ValueError(msg)
 
             # Check config keys
             valid_objs = {"Sharpe", "MinRisk", "MaxRet", "Utility"}
-            obj = self.optimizer_config.get("obj", "Sharpe")
+            obj = self._config.get("obj", "Sharpe")
             if obj not in valid_objs:
                 raise ValueError(f"Invalid objective '{obj}'. Must be one of {valid_objs}.")
 
         else:
             # Set default config
-            self.optimizer_config = {
+            self._config = {
                 "model": "Classic",          # Classic Markowitz optimizer
                 "rm": "MV",                  # Risk Measure: MV = Variance
                 "rf": 0,                     # Risk-free rate (in decimal form)
@@ -327,12 +390,14 @@ class FactorModelOptimizer(RiskfolioOptimizer):
                 "f_scalar": None             # Scalar applied to expected factor returns [0,1]
             }
 
-        returns_var = self.optimizer_config.pop('returns_var')
-        self.returns = self.bw_daily_df[returns_var].unstack(level='ticker')
+        if self.input_config is None:
+            self.input_config = self._config.copy()
+
+        returns_var = self._config.pop('returns_var')
+        returns = self.bw_daily_df[returns_var].unstack(level='ticker')
 
         # Only used for number of assets and tickers
-        self.port = rp.Portfolio(returns=self.returns)
-
+        self.port = rp.Portfolio(returns=returns)
 
 
     def compute_mu_sigma(self):
@@ -364,12 +429,11 @@ class FactorModelOptimizer(RiskfolioOptimizer):
         mkt_factor_ret = window_df.groupby('date')['market_factor_return'].first().to_frame(name='Market')
         sctr_factor_ret = window_df.groupby(['bw_sector_name', 'date'])['sector_factor_return'].first().unstack().T
         factor_returns = pd.concat([mkt_factor_ret, sctr_factor_ret], axis=1)
-        self.factor_returns = factor_returns
 
-        method_f = self.optimizer_config.pop('method_f', None)
+        method_f = self._config.pop('method_f', None)
+        halflife = self._config.pop('halflife', None)
 
         if method_f == 'ewma':
-            halflife = self.optimizer_config.pop('halflife')
             self.f = factor_returns.ewm(halflife=halflife).mean().iloc[-1].to_frame(name='f')
         elif method_f == 'hist':
             self.f = factor_returns.mean(axis=0).to_frame(name='f')
@@ -378,7 +442,7 @@ class FactorModelOptimizer(RiskfolioOptimizer):
             self.f = factor_returns.mean(axis=0).to_frame(name='f')
 
         # --- 5. Factor covariance matrix F ---
-        method_F = self.optimizer_config.pop('method_F')
+        method_F = self._config.pop('method_F')
 
         if method_F == 'ewma':
             self.F = factor_returns.ewm(halflife=halflife).cov().iloc[-factor_returns.shape[1]:]  # last cov matrix
@@ -391,50 +455,51 @@ class FactorModelOptimizer(RiskfolioOptimizer):
         # --- 6. Expected returns μ = B @ f ---
 
         # Scaled f if not confident in estimate
-        f_scalar = self.optimizer_config.pop('f_scalar', None)
+        f_scalar = self._config.pop('f_scalar', None)
         if f_scalar is not None:
             self.scaled_f = self.f * f_scalar
             mu = self.B.values @ self.scaled_f.values
-            mu = mu.flatten()
-            self.mu = pd.DataFrame([mu], columns=self.B.index, dtype=np.float64)
-
         else:
             mu = self.B.values @ self.f.values
-            mu = mu.flatten()
-            self.mu = pd.DataFrame([mu], columns=self.B.index, dtype=np.float64)
+
+        self.mu_ = pd.Series(mu.flatten(), index=self.B.index, dtype=np.float64)
 
         # --- 9. Covariance matrix Σ = B F Bᵗ + D ---
         sigma_vals = self.B.values @ self.F.values @ self.B.values.T + self.D.values
-        self.sigma = pd.DataFrame(sigma_vals,
+        self.sigma_ = pd.DataFrame(sigma_vals,
                                   index=self.B.index,
                                   columns=self.B.index,
                                   dtype=np.float64
                                   )
 
-    def optimize(self):
+    def fit(self):
         """
         Optimizes portfolio using computed mu and sigma from factor model.
         """
 
         # Check for computed sigma, mu
-        if self.sigma is None:
+        if self.sigma_ is None:
             self.compute_mu_sigma()
 
         # Assign factor sigma, mu
-        self.port.mu = self.mu
-        self.port.cov = self.sigma
+        self.port.mu = self.mu_
+        self.port.cov = self.sigma_
 
         # Assign portfolio leverage and short/long budget
-        self.port.sht = self.optimizer_config.pop('sht', False)
-        self.port.budget = self.optimizer_config.pop('budget', 1.0)
-        self.port.uppersht = self.optimizer_config.pop('uppersht', 1.0)
-        self.port.upperlng = self.optimizer_config.pop('upperlng', 1.0)
+        self.port.sht = self._config.pop('sht', False)
+        self.port.budget = self._config.pop('budget', 1.0)
+        self.port.uppersht = self._config.pop('uppersht', 1.0)
+        self.port.upperlng = self._config.pop('upperlng', 1.0)
 
 
         # Run optimization
-        self.w = self.port.optimization(**self.optimizer_config)
+        self.weights_ = self.port.optimization(**self._config)
 
-        return self.w
+        # Reset optimizer_config to input
+        self._config = self.input_config
+
+        # Calculate portfolio in-sample Sharpe and volatility
+        self._calculate_in_sample_sharpe()
 
 
 """
@@ -450,6 +515,6 @@ class BlackLittermanOptimizer(RiskfolioOptimizer):
     def configure_optimizer(self):
         pass
 
-    def optimize(self) -> None:
+    def fit(self) -> None:
         pass
 """
