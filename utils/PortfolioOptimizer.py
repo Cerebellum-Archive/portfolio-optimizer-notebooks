@@ -1,520 +1,1382 @@
 import pandas as pd
 import numpy as np
-import warnings
+from sklearn.base import BaseEstimator, TransformerMixin, RegressorMixin
+from sklearn.utils.validation import check_is_fitted
 import riskfolio as rp
 import xarray as xr
-import matplotlib.pyplot as plt
-import plotly.graph_objects as go
 
+from utils.logging_config import setup_logger
+logger = setup_logger(__name__)
 
-class RiskfolioOptimizer:
-    def __init__(self, daily_ds:xr.Dataset, optimizer_config:dict=None):
+class BasePortfolioOptimizer(BaseEstimator, TransformerMixin, RegressorMixin):
+    """Base scikit-learn compatible portfolio optimizer."""
+
+    def __init__(self):
         """
-        Initialize the RiskfolioOptimizer with a pre-sliced xarray dataset.
+        Initialize the optimizer with configuration parameters.
+        """
+
+        # Internal attributes
+        self._fitted_attrs = [
+            'mu_', 'sigma_', 'weights_', 'gross_exposure_',
+            'sharpe_', 'port_vol_', 'port_return_', 'port_'
+        ]
+
+    def _reset_fitted_attrs(self):
+        """Reset all fitted attributes."""
+        for attr in self._fitted_attrs:
+            setattr(self, attr, None)
+
+    def _get_config(self):
+        """Get current configuration as dict."""
+        config = {}
+        for param in self.get_params():
+            config[param] = getattr(self, param)
+        return config
+
+    def _validate_input(self, X, y=None, require_targets=False):
+        """
+        Validate input data format.
 
         Parameters
         ----------
-        daily_ds : xr.Dataset
-            A sliced xarray dataset with dimensions ['date', 'ticker'] and containing
-            variables named in Blue Water conventions (return, variance, etc.).
-            Expected to be in percentage terms.
+        X : xr.Dataset or pd.DataFrame
+            Input features (returns data)
+        y : array-like, optional
+            Target values (for compatibility, usually None)
+        require_targets : bool
+            Whether targets are required
 
-        optimizer_config : dict, optional
-            Configuration dictionary to specify optimization model parameters such as
-            risk measure, objective function, constraints, etc.
-
-        Notes
-        -----
-        This initializer will:
-        - Infer start/end dates and tickers from the dataset's coordinates.
-        - Convert the dataset to a tidy DataFrame (self.bw_daily_df).
-        - Convert return/variance columns from percentage to decimal format.
+        Returns
+        -------
+        bw_daily_df : pd.DataFrame
+            Processed DataFrame in Blue Water format
         """
+        if isinstance(X, xr.Dataset):
+            # Convert xarray dataset to DataFrame
+            df = X.to_dataframe().reset_index()
+            df.set_index(["date", "ticker"], inplace=True)
+            df.sort_index(level=['date', 'ticker'], inplace=True)
 
-        # Store metadata
-        self.start_date = daily_ds.coords["date"].values[0]
-        self.end_date = daily_ds.coords["date"].values[-1]
-        self.tickers = list(daily_ds.coords["ticker"].values)
-        self._config = optimizer_config
-        if optimizer_config is not None:
-            self.input_config = optimizer_config.copy()
+            # Convert returns/variances from percentage to decimal
+            for col in df.columns:
+                if "return" in col.lower() or "variance" in col.lower():
+                    df[col] = df[col] * 0.01
+
+        elif isinstance(X, pd.DataFrame):
+            df = X.copy()
+            # Assume already in correct format
         else:
-            self.input_config = None
+            raise ValueError("X must be xr.Dataset or pd.DataFrame")
 
-        # Convert xarray dataset to DataFrame
-        self.bw_daily_df = self._convert_bw_ds_to_df(daily_ds)
+        # Check for NaNs
+        if df.isnull().any().any():
+            raise ValueError("Input data contains NaN values")
 
-        # Placeholders for optimization components
-        self.mu_ = None                    # Expected returns
-        self.sigma_ = None                 # Covariance matrix
-        self.weights_ = None               # Optimized weights
-        self.sharpe_ = None                # Portfolio in-sample Sharpe
-        self.port_vol_ = None              # Portfolio volatility
-        self.port_return_ = None           # in-sample returns
-        self.predicted_return_ = None      # out-of-sample returns
-        self.port = None                   # Riskfolio portfolio object
-
-
-    def configure_optimizer(self):
-        raise NotImplementedError("Subclasses must implement the configure_optimizer() method.")
-
-    def fit(self):
-        raise NotImplementedError("Subclasses must implement the fit() method.")
-
-    def predict(self, returns_next: xr.Dataset) -> float:
-        """
-        Predicts realized portfolio return using actual asset returns from the next day.
-        These are multiplied by the optimized weights (self.weights_).
-
-        Parameters
-        ----------
-        returns_next : xr.Dataset
-            Slice of the dataset with one date and asset-level returns.
-            Expected to be in percentage units (0.52 = 0.52%).
-        """
-        returns_var = self._config.get("returns_var", "return")
-
-        # Convert to Series (e.g. ticker → return)
-        returns_next = returns_next[returns_var].to_series() * 0.01
-        returns_next.index.name = 'ticker'
-
-        # Align with optimized weights
-        returns_next = returns_next.reindex(self.weights_.index)
-
-        # Predict portfolio return
-        self.predicted_return_ = (self.weights_.T @ returns_next).values.item()
-        return self.predicted_return_
-
-
-    def _convert_bw_ds_to_df(self, ds:xr.Dataset) -> pd.DataFrame:
-        # Convert xarray dataset to DataFrame
-        df = ds.to_dataframe().reset_index()
-        df.set_index(["date", "ticker"], inplace=True)
-        df.sort_index(level=['date', 'ticker'], inplace=True)
-
-        # Convert returns/variances from percentage to decimal
-        for col in df.columns:
-            if "return" in col.lower() or "variance" in col.lower():
-                df[col] = df[col] * 0.01
         return df
 
-    def _calculate_in_sample_sharpe(self) -> float:
-        # Calculate portfolio in-sample Sharpe and volatility
-        self.port_return_ = (self.weights_.T @ self.mu_).values.item()
-        self.port_vol_ = (np.sqrt(self.weights_.T @ self.sigma_ @ self.weights_)
-                          .values.item()
-                          )
-        rf = self._config.get('rf', 0)
-        self.sharpe_ = (self.port_return_ - rf) / self.port_vol_
-        return self.sharpe_
+    def _calculate_in_sample_stats(self):
+        """Calculate portfolio in-sample statistics."""
+        if self.weights_ is None or self.mu_ is None or self.sigma_ is None:
+            return
 
-    def plot_weights(self):
-        if self.weights_ is not None:
-            has_negative = (self.weights_ < 0).any().item()
+        self.port_return_ = float((self.weights_.T @ self.mu_).values.item())
+        self.port_vol_ = float(np.sqrt(self.weights_.T @ self.sigma_ @ self.weights_).values.item())
 
-        weights = self.weights_.iloc[:,0] # TODO: convert type try to clean up later
-        if has_negative:
-            weights.sort_values(ascending=True).plot(kind='barh', title='Optimized Portfolio Weights')
-            plt.xlabel("Weight")
-            plt.ylabel("Ticker")
+        rf = getattr(self, 'rf', 0.0)
+        self.sharpe_ = (self.port_return_ - rf) / self.port_vol_ if self.port_vol_ > 0 else 0.0
+
+    def fit(self, X, y=None):
+        """
+        Fit the portfolio optimizer.
+
+        Parameters
+        ----------
+        X : xr.Dataset or pd.DataFrame
+            Input returns data
+        y : array-like, optional
+            Ignored, for sklearn compatibility
+
+        Returns
+        -------
+        self : object
+            Returns self
+        """
+        # Reset fitted attributes
+        self._reset_fitted_attrs()
+
+        # Validate and process input
+        self.bw_daily_df_ = self._validate_input(X, y)
+
+        # Store metadata
+        dates = self.bw_daily_df_.index.get_level_values('date').unique()
+        tickers = self.bw_daily_df_.index.get_level_values('ticker').unique()
+
+        self.start_date_ = dates[0]
+        self.end_date_ = dates[-1]
+        self.tickers_ = list(tickers)
+
+        # Fit the specific optimizer
+        self._fit_optimizer()
+
+        return self
+
+    def _fit_optimizer(self):
+        """Override in subclasses to implement specific fitting logic."""
+        raise NotImplementedError("Subclasses must implement _fit_optimizer")
+
+    def transform(self, X):
+        """
+        Transform returns the optimized weights.
+
+        Parameters
+        ----------
+        X : xr.Dataset or pd.DataFrame
+            Input data (can be different from fit data for validation)
+
+        Returns
+        -------
+        weights : np.ndarray
+            Optimized portfolio weights
+        """
+        check_is_fitted(self)
+        return self.weights_.values
+
+    def predict(self, X):
+        """
+        Predict portfolio returns using optimized weights.
+        This method delegates to subclass-specific prediction logic.
+
+        Parameters
+        ----------
+        X : xr.Dataset or pd.DataFrame
+            Future returns/factor data for prediction
+
+        Returns
+        -------
+        predicted_returns : np.ndarray
+            Predicted portfolio returns
+        """
+        check_is_fitted(self)
+        predictions = np.atleast_1d(self._predict_optimizer(X))
+        return predictions
+
+    def _predict_optimizer(self, X):
+        """Override in subclasses to implement specific prediction logic."""
+        raise NotImplementedError("Subclasses must implement _predict_optimizer")
+
+    def get_weights(self):
+        """Get optimized weights as pandas Series."""
+        check_is_fitted(self)
+        return self.weights_.copy().squeeze()
+
+    def get_portfolio_stats(self, active_threshold=0.001):
+        """Get portfolio statistics."""
+        check_is_fitted(self)
+        active_positions = np.abs(self.weights_) > active_threshold
+        return {
+            'portfolio_return': self.port_return_,
+            'portfolio_volatility': self.port_vol_,
+            'sharpe_ratio': self.sharpe_,
+            'gross_exposure': self.gross_exposure_,
+            'num_assets': active_positions.sum().values[0],
+            'long_exposure': self.weights_[self.weights_ > 0].sum().values[0],
+            'short_exposure': self.weights_[self.weights_ < 0].sum().values[0],
+            'net_exposure': self.weights_.sum().values[0]
+        }
+
+
+class ClassicOptimizer(BasePortfolioOptimizer):
+    """Scikit-learn compatible ClassicOptimizer.
+
+    Parameters
+    ----------
+    method_mu : str, default='hist'
+        Method for expected returns estimation
+    method_cov : str, default='hist'
+        Method for covariance estimation
+    ewma_mu_halflife : float, optional
+        EWMA halflife for returns
+    ewma_cov_halflife : float, optional
+        EWMA halflife for covariance
+    returns_var : str, default='return'
+        Column name for returns
+    rm : str, default='MV'
+        Risk measure
+    obj : str, default='Sharpe'
+        Optimization objective
+    rf : float, default=0.0
+        Risk-free rate
+    l : float, default=0.0
+        Risk aversion parameter
+    sht : bool, default=False
+        Allow short positions
+    budget : float, default=1.0
+        Total budget constraint
+    budgetsht : float, default=0.2
+        Short budget constraint
+    uppersht : float, default=0.2
+        Upper bound for short positions
+    upperlng : float, default=1.0
+        Upper bound for long positions
+    user_input_mu : pd.Series, optional
+        Custom expected returns
+    user_input_cov : pd.DataFrame, optional
+        Custom covariance matrix
+    """
+
+    def __init__(self,
+                 method_mu='hist',
+                 method_cov='hist',
+                 ewma_mu_halflife=None,
+                 ewma_cov_halflife=None,
+                 returns_var='return',
+                 rm='MV',
+                 obj='Sharpe',
+                 rf=0.0,
+                 l=0.0,
+                 sht=False,
+                 budget=1.0,
+                 budgetsht=0.2,
+                 uppersht=0.2,
+                 upperlng=1.0,
+                 user_input_mu=None,
+                 user_input_cov=None):
+
+        # Store all parameters as instance attributes (required for sklearn)
+        self.method_mu = method_mu
+        self.method_cov = method_cov
+        self.ewma_mu_halflife = ewma_mu_halflife
+        self.ewma_cov_halflife = ewma_cov_halflife
+        self.returns_var = returns_var
+        self.rm = rm
+        self.obj = obj
+        self.rf = rf
+        self.l = l
+        self.sht = sht
+        self.budget = budget
+        self.budgetsht = budgetsht
+        self.uppersht = uppersht
+        self.upperlng = upperlng
+        self.user_input_mu = user_input_mu
+        self.user_input_cov = user_input_cov
+
+        # Call parent constructor
+        super().__init__()
+        super()._reset_fitted_attrs()
+
+    def _halflife_to_d(self, halflife):
+        """Convert halflife to decay parameter."""
+        return 2 ** (-1 / halflife)
+
+    def _d_to_halflife(self, d):
+        """Convert decay parameter to halflife."""
+        return -1 / np.log2(d)
+
+    def _fit_optimizer(self):
+        """Fit the Classic optimizer."""
+        # Create returns matrix
+        returns = self.bw_daily_df_[self.returns_var].unstack(level='ticker')
+
+        # Create portfolio object
+        self.port_ = rp.Portfolio(returns=returns)
+
+        # Handle custom inputs
+        mu = self.user_input_mu
+        sigma = self.user_input_cov
+
+        # Validate custom inputs if provided
+        if mu is not None and self.method_mu == 'custom':
+            mu = mu.sort_index()
+            mu.index.name = "ticker"
+            if mu.shape[0] != returns.shape[1]:
+                raise ValueError(f"mu length {mu.shape[0]} does not match number of assets {returns.shape[1]}")
+            mu = mu.reindex(returns.columns)
+
+        if sigma is not None and self.method_cov == 'custom':
+            sigma = sigma.sort_index().sort_index(axis=1)
+            sigma.index.name = "ticker"
+            sigma.columns.name = "ticker"
+            if sigma.shape != (returns.shape[1], returns.shape[1]):
+                raise ValueError(f"Sigma shape {sigma.shape} does not match number of assets")
+            sigma = sigma.reindex(index=returns.columns, columns=returns.columns)
+
+        # Prepare method parameters
+        dict_mu = {}
+        dict_cov = {}
+
+        # EWMA conversions if needed
+        if self.method_mu in ('ewma1', 'ewma2'):
+            if self.ewma_mu_halflife is not None:
+                dict_mu['d'] = self._halflife_to_d(self.ewma_mu_halflife)
+
+        if self.method_cov in ('ewma1', 'ewma2'):
+            if self.ewma_cov_halflife is not None:
+                dict_cov['d'] = self._halflife_to_d(self.ewma_cov_halflife)
+
+        # Calculate statistics based on method combination
+        if self.method_mu != 'custom' and self.method_cov != 'custom':
+            self.port_.assets_stats(method_mu=self.method_mu, method_cov=self.method_cov,
+                                   dict_mu=dict_mu, dict_cov=dict_cov)
+        elif self.method_mu == 'custom' and self.method_cov != 'custom':
+            self.port_.assets_stats(method_cov=self.method_cov, dict_cov=dict_cov)
+            self.port_.mu = mu
+        elif self.method_cov == 'custom' and self.method_mu != 'custom':
+            self.port_.assets_stats(method_mu=self.method_mu, dict_mu=dict_mu)
+            self.port_.cov = sigma
         else:
-            weights.sort_values(ascending=False).plot(kind='barh', title='Optimized Portfolio Weights')
-            plt.ylabel("Weight")
-            plt.xlabel("Ticker")
-            plt.axvline(0, color='black', linewidth=0.8) if has_negative else None
-            plt.tight_layout()
-            plt.show()
+            self.port_.mu = mu
+            self.port_.cov = sigma
 
+        # Store computed statistics
+        self.sigma_ = self.port_.cov.copy()
+        self.sigma_.index.name = 'ticker'
+        self.sigma_.columns.name = 'ticker'
+        self.mu_ = self.port_.mu.squeeze().copy()
+        if np.isscalar(self.mu_):
+            self.mu_ = pd.Series([self.mu_], index=self.sigma_.index)
+        self.mu_.index.name = 'ticker'
+        self.mu_.name = None
 
-    def plot_weights_plotly(self):
-        if self.weights_ is not None:
-            weights = self.weights_.sort_values(by='weights')
-            tickers = weights.index
-            values = weights['weights'].values.flatten()
+        # Set portfolio constraints
+        self.port_.sht = self.sht
+        self.port_.budget = self.budget
+        self.port_.budgetsht = self.budgetsht
+        self.port_.uppersht = self.uppersht
+        self.port_.upperlng = self.upperlng
 
-            colors = np.where(values >= 0, '#1f77b4', '#ff7f0e')
-            text_positions = ['middle right' if v >= 0 else 'middle left' for v in values]
-            text_labels = [f"{v:.1%}  {ticker}" if v >= 0 else f"{v:.1%}  {ticker}"
-                           for v, ticker in zip(values, tickers)]
+        # Prepare optimization config
+        opt_config = {
+            'rm': self.rm,
+            'obj': self.obj,
+            'rf': self.rf,
+            'l': self.l
+        }
 
-            fig = go.Figure()
+        # Run optimization
+        self.weights_ = self.port_.optimization(**opt_config)
 
-            # Lollipop sticks
-            for val, i in zip(values, range(len(tickers))):
-                fig.add_trace(go.Scatter(
-                    x=[0, val], y=[i, i],
-                    mode='lines',
-                    line=dict(color='lightgray', width=2),
-                    showlegend=False,
-                    hoverinfo='skip'
-                ))
+        # Calculate derived statistics
+        self.gross_exposure_ = self.weights_.abs().sum()
+        self._calculate_in_sample_stats()
 
-            # Lollipop heads
-            fig.add_trace(go.Scatter(
-                x=values,
-                y=list(range(len(tickers))),
-                mode='markers+text',
-                marker=dict(size=10, color=colors),
-                text=text_labels,
-                textposition=text_positions,
-                textfont=dict(size=10, color=colors),
-                hovertemplate='%{text}<extra></extra>',
-                showlegend=False
-            ))
+    def _predict_optimizer(self, X):
+        """
+        Classic optimizer prediction: w^T * r
+        Requires asset-level returns (tickers × time).
+        """
+        if isinstance(X, xr.Dataset):
+            returns_var = getattr(self, 'returns_var', 'return')
+            returns = X[returns_var].sel(ticker=self.weights_.index) * 0.01
 
-            # Layout settings
-            fig.update_layout(
-                title=dict(
-                    text='Optimized Portfolio Weights',
-                    x=0.5, xanchor='center',
-                    font=dict(size=16, family='Arial', color='black')
-                ),
-                xaxis_title='Weight',
-                xaxis_tickformat='.0%',
-                plot_bgcolor='white',
-                height=max(400, 20 * len(weights)),
-                margin=dict(l=120, r=120, t=60, b=40)
+            # Convert weights to xarray
+            w = self.get_weights()
+            w = xr.DataArray(
+                w.values,
+                dims=["ticker"],
+                coords={"ticker": w.index},
             )
 
-            fig.update_yaxes(showticklabels=False, showgrid=False, zeroline=False)
-            fig.update_xaxes(showgrid=False, zeroline=True, zerolinecolor='black')
-            fig.show(config={'responsive': True})
+            # Portfolio returns: w^T * r
+            predictions = xr.dot(returns, w, dim='ticker').values
+            return predictions
 
-
-    def plot_frontier(self, points=30, current_weights=None):
-        if self.port is not None:
-            # Generate efficient frontier
-            frontier = self.port.efficient_frontier(points=points)
-
-            # Plot optimized portfolio
-            ax = rp.plot_frontier(w_frontier=frontier,
-                                  mu=self.mu_,
-                                  cov=self.port.cov,
-                                  returns=self.port.returns,
-                                  w=self.weights_,
-                                  label='Optimized',
-                                  marker='*',
-                                  s=16,
-                                  c='r')
-
-            # Plot current portfolio if provided
-            if current_weights is not None:
-                current_weights = current_weights.reindex(self.weights_.index).fillna(0)
-                port_return = np.dot(current_weights, self.mu_.values.flatten())
-                port_risk = np.sqrt(np.dot(current_weights.T, np.dot(self.port.cov.values, current_weights)))
-                ax.scatter(port_risk, port_return, marker='o', s=16, color='red', label='Current Position')
-
-            fig = ax.get_figure()
-            fig.set_constrained_layout(True)
-
-            plt.show()
-
-
-class ClassicOptimizer(RiskfolioOptimizer):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.configure_optimizer()
-
-    def configure_optimizer(self):
-        # Check that returns are provided
-        if self.bw_daily_df is None or self.bw_daily_df.empty:
-            raise ValueError("Return data (bw_daily_df) is empty or not provided.")
-
-        # Check for NaNs
-        if self.bw_daily_df.isnull().any().any():
-            raise ValueError("bw_daily_df contains NaN values.")
-
-        if self._config is not None:
-            # Check model
-            if self._config.get('model') != 'Classic':
-                msg = ("ClassicOptimizer requires optimizer_config['model'] == 'Classic'.")
-                raise ValueError(msg)
-
-            # Check config keys
-            valid_objs = {"Sharpe", "MinRisk", "MaxRet", "Utility"}
-            obj = self._config.get("obj", "Sharpe")
-            if obj not in valid_objs:
-                raise ValueError(f"Invalid objective '{obj}'. Must be one of {valid_objs}.")
+        elif isinstance(X, pd.DataFrame):
+            # Assume X is already in returns format (tickers as columns)
+            aligned_returns = X.reindex(columns=self.weights_.index)
+            predictions = (aligned_returns @ self.weights_.values).values
+            return predictions
 
         else:
-            # Set default config
-            self._config = {
-                "model": "Classic",          # Classic Markowitz optimizer
-                "rm": "MV",                  # Risk Measure: MV = Variance
-                "rf": 0,                     # Risk-free rate (in decimal form)
-                "l": 0,                      # Risk aversion (used in some models)
-                "method_mu": "ewma",         # Method to estimate expected returns
-                "method_cov": "ewma",        # Method to estimate covariance matrix
-                "halflife": 30,              # EWMA halflife in trading days
-                "obj": "Sharpe",             # Optimization objective
-                "hist": False,               # sigma & mu are computed from asset_stats
-                "sht": True,                 # Allow shorts
-                "budget": 1.0,               # Absolute sum of weights
-                "uppersht": 1.0,             # Maximum sum of absolute values of short
-                "upperlng": 1.0,             # Maximum of the sum of long
-                "returns_var": "return",     # Returns variable name: 'return' or 'residual_return'
-                "mu_scalar": None            # Scalar applied to expected returns [0,1]
-            }
+            raise ValueError("X must be xr.Dataset or pd.DataFrame")
 
-        if self.input_config is None:
-            self.input_config = self._config.copy()
 
-        # Load historical returns into optimizer
-        returns_var = self._config.pop('returns_var')
-        returns = self.bw_daily_df[returns_var].unstack(level='ticker')
+class FactorModelOptimizer(BasePortfolioOptimizer):
+    """Scikit-learn compatible Factor Model optimizer.
 
-        # Create portfolio
-        self.port = rp.Portfolio(returns=returns)
+    Parameters
+    ----------
+    method_f : str, default='ewma1'
+        Method for factor return estimation
+    method_F : str, default='ewma1'
+        Method for factor covariance estimation
+    halflife : int, default=30
+        EWMA halflife in days
+    returns_var : str, default='return'
+        Column name for returns
+    rm : str, default='MV'
+        Risk measure
+    obj : str, default='Sharpe'
+        Optimization objective
+    rf : float, default=0.0
+        Risk-free rate
+    l : float, default=0.0
+        Risk aversion parameter
+    sht : bool, default=True
+        Allow short positions
+    budget : float, default=1.0
+        Total budget constraint
+    budgetsht : float, default=0.2
+        Short budget constraint
+    uppersht : float, default=0.2
+        Upper bound for short positions
+    upperlng : float, default=1.0
+        Upper bound for long positions
+    user_input_mu : pd.Series, optional
+        Custom expected returns
+    user_input_cov : pd.DataFrame, optional
+        Custom covariance matrix
+    use_custom_inputs : bool, default=False
+        Whether to use custom mu/sigma instead of factor model computation
+    """
 
-        # Determine mean/covariance method for stats
-        method_mu = self._config.pop('method_mu', 'hist')
-        method_cov = self._config.pop('method_cov', 'hist')
+    def __init__(self,
+                 method_f='ewma1',
+                 method_F='ewma1',
+                 halflife=30,
+                 returns_var='return',
+                 rm='MV',
+                 obj='Sharpe',
+                 rf=0.0,
+                 l=0.0,
+                 sht=True,
+                 budget=1.0,
+                 budgetsht=0.2,
+                 uppersht=0.2,
+                 upperlng=1.0,
+                 user_input_mu=None,
+                 user_input_cov=None,
+                 use_custom_inputs=False):
 
-        # Handle EWMA case with fallback halflife
-        if method_mu == 'ewma' or method_cov == 'ewma':
-            if self._config.get('hist', None):
-                warnings.warn(
-                    "The optimizer configuration specified EWMA."
-                    "Preventing accidental override: setting 'hist' to False."
-                )
-                self._config['hist'] = False
-                self.input_config['hist'] = False
+        # Store all parameters as instance attributes (required for sklearn)
+        self.method_f = method_f
+        self.method_F = method_F
+        self.halflife = halflife
+        self.returns_var = returns_var
+        self.rm = rm
+        self.obj = obj
+        self.rf = rf
+        self.l = l
+        self.sht = sht
+        self.budget = budget
+        self.budgetsht = budgetsht
+        self.uppersht = uppersht
+        self.upperlng = upperlng
+        self.user_input_mu = user_input_mu
+        self.user_input_cov = user_input_cov
+        self.use_custom_inputs = use_custom_inputs
 
-            halflife = self._config.pop('halflife', None)
-            if halflife is None:
-                halflife = 30  # Default fallback
-                warnings.warn(
-                    "Optimizer config did not specify a halflife for EWMA. "
-                    "Defaulting to halflife=30."
-                )
-            mu = returns.ewm(halflife=halflife).mean().iloc[-1]
-            cov = returns.ewm(halflife=halflife).cov().iloc[-returns.shape[1]:]
+        # Factor model specific attributes
+        self._factor_attrs = ['B_', 'F_', 'D_', 'f_', 'mu_residual_']
 
-            self.port.mu = mu
-            self.port.cov = cov.droplevel('date')
+        # Call parent constructor
+        super().__init__()
+        self._reset_fitted_attrs()
 
+    def _reset_fitted_attrs(self):
+        """Reset fitted attributes including factor-specific ones."""
+        super()._reset_fitted_attrs()
+        for attr in self._factor_attrs:
+            setattr(self, attr, None)
+
+    def _validate_factor_data(self, df):
+        """Validate factor model data requirements."""
+        # Skip validation if using custom inputs
+        if self.use_custom_inputs:
+            return
+
+        required_cols = [
+            'market_beta', 'sector_beta', 'bw_sector_name',
+            'residual_variance', 'market_factor_return',
+            'sector_factor_return', 'residual_return'
+        ]
+
+        missing_cols = [col for col in required_cols if col not in df.columns]
+        if missing_cols:
+            raise ValueError(f"Missing required factor model columns: {missing_cols}")
+
+    def _validate_custom_inputs(self, returns):
+        """Validate custom mu and sigma inputs."""
+        mu = self.user_input_mu
+        sigma = self.user_input_cov
+
+        if mu is not None:
+            mu = mu.sort_index()
+            mu.index.name = "ticker"
+            if mu.shape[0] != returns.shape[1]:
+                raise ValueError(f"mu length {mu.shape[0]} does not match number of assets {returns.shape[1]}")
+            # Align with returns columns
+            mu = mu.reindex(returns.columns)
+            self.user_input_mu = mu
+
+        if sigma is not None:
+            sigma = sigma.sort_index().sort_index(axis=1)
+            sigma.index.name = "ticker"
+            sigma.columns.name = "ticker"
+            if sigma.shape != (returns.shape[1], returns.shape[1]):
+                raise ValueError(f"Sigma shape {sigma.shape} does not match number of assets")
+            # Align with returns columns
+            sigma = sigma.reindex(index=returns.columns, columns=returns.columns)
+            self.user_input_cov = sigma
+
+    def _fit_optimizer(self):
+        """Fit the Factor Model optimizer."""
+        # Create basic portfolio object for optimization
+        returns = self.bw_daily_df_[self.returns_var].unstack(level='ticker')
+        self.port_ = rp.Portfolio(returns=returns)
+
+        if self.use_custom_inputs:
+            # Use custom inputs instead of factor model computation
+            self._fit_with_custom_inputs(returns)
         else:
-            # Apply simple 'hist'
-            self._config.pop('halflife', None) # Remove 'halflife'
-            self.port.assets_stats(method_mu=method_mu, method_cov=method_cov)
+            # Validate factor model data
+            self._validate_factor_data(self.bw_daily_df_)
+            # Compute factor model statistics
+            self._compute_factor_model_stats()
 
+        # Assign computed statistics to portfolio
+        self.port_.mu = self.mu_
+        self.port_.cov = self.sigma_
 
-    def fit(self):
-        """
-        Calculates optimized weights from historical returns.
-        """
+        # Set portfolio constraints
+        self.port_.sht = self.sht
+        self.port_.budget = self.budget
+        self.port_.budgetsht = self.budgetsht
+        self.port_.uppersht = self.uppersht
+        self.port_.upperlng = self.upperlng
 
-        # Assign sigma, mu used for optimization
-        self.sigma_ = self.port.cov
+        # Prepare optimization config
+        opt_config = {
+            'model': 'Classic',  # Required for factor models
+            'rm': self.rm,
+            'obj': self.obj,
+            'rf': self.rf,
+            'l': self.l,
+            'hist': False
+        }
 
-        # Scaled mu if not confident in estimate
-        mu_scalar = self._config.pop('mu_scalar', None)
-        if mu_scalar is not None:
-            scaled_mu = self.port.mu * mu_scalar
-            self.port.mu = scaled_mu
-            self.mu_ = self.port.mu
-        else:
-            self.mu_ = self.port.mu
-        self.mu_ = self.mu_.squeeze()
+        # Run optimization
+        self.weights_ = self.port_.optimization(**opt_config)
+
+        # Calculate derived statistics
+        self.gross_exposure_ = self.weights_.abs().sum()
+        self._calculate_in_sample_stats()
+
+    def _fit_with_custom_inputs(self, returns):
+        """Fit optimizer using custom mu and sigma inputs."""
+        logger.info("Using custom mu and sigma inputs instead of factor model computation...")
+
+        # Validate custom inputs
+        self._validate_custom_inputs(returns)
+
+        # Check if both mu and sigma are provided
+        if self.user_input_mu is None or self.user_input_cov is None:
+            raise ValueError("Both user_input_mu and user_input_cov must be provided when use_custom_inputs=True")
+
+        # Use custom inputs directly
+        self.mu_ = self.user_input_mu.copy()
         self.mu_.index.name = 'ticker'
+        self.mu_.name = None
 
-        # Assign portfolio leverage and long/short budget
-        self.port.sht = self._config.pop('sht', False)
-        self.port.budget = self._config.pop('budget', 1.0)
-        self.port.uppersht = self._config.pop('uppersht', 1.0)
-        self.port.upperlng = self._config.pop('upperlng', 1.0)
+        self.sigma_ = self.user_input_cov.copy()
+        self.sigma_.index.name = 'ticker'
+        self.sigma_.columns.name = 'ticker'
 
-        # Run optimization
-        self.weights_ = self.port.optimization(**self._config)
+        # Ensure positive definite for sigma
+        eigenvals = np.linalg.eigvals(self.sigma_.values)
+        if np.any(eigenvals <= 0):
+            logger.warning("Custom covariance matrix is not positive definite. "
+                          "Adding small regularization.")
+            self.sigma_ += np.eye(self.sigma_.shape[0]) * 1e-8
 
-        # Reset optimizer_config to input
-        self._config = self.input_config
+        # Set factor model attributes to None since we're not computing them
+        for attr in self._factor_attrs:
+            setattr(self, attr, None)
 
-        # Calculate portfolio in-sample Sharpe and volatility
-        self._calculate_in_sample_sharpe()
+        logger.info(f"Using custom mu with shape: {self.mu_.shape}")
+        logger.info(f"Using custom sigma with shape: {self.sigma_.shape}")
 
+    def _compute_factor_model_stats(self):
+        """Compute factor model mu and sigma."""
+        logger.info("Computing factor model mu and sigma...")
 
-class FactorModelOptimizer(RiskfolioOptimizer):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.configure_optimizer()
+        # Get exposures from final date
+        try:
+            end_df = self.bw_daily_df_.xs(self.end_date_, level='date')
+        except KeyError:
+            raise ValueError(f"End date {self.end_date_} not found in data")
 
-        self.B = None  # factor exposure matrix
-        self.F = None  # factor covariance matrix
-        self.D = None  # residual matrix
-        self.f = None  # expected factor returns vector
-        self.f_scaled = None  # scaled factor returns vector
+        # Construct factor exposure matrix B
+        try:
+            market_beta = end_df[['market_beta']].copy()
+            market_beta.columns = ['Market']
 
+            sector_dummies = pd.get_dummies(end_df['bw_sector_name'])
+            sector_beta = sector_dummies.mul(end_df['sector_beta'], axis=0)
 
-    def configure_optimizer(self):
-        # Check that factor returns are provided
-        if self.bw_daily_df is None or self.bw_daily_df.empty:
-            raise ValueError("Return data (bw_daily_df) is empty or not provided.")
+            self.B_ = pd.concat([market_beta, sector_beta], axis=1).astype(np.float64)
 
-        # Check for NaNs
-        if self.bw_daily_df.isnull().any().any():
-            raise ValueError("bw_daily_df contains NaN values.")
+            logger.info(f"Factor exposure matrix B shape: {self.B_.shape}")
 
-        if self._config is not None:
-            # Check model and hist
-            if self._config.get('model') != 'Classic' or self._config.get('hist') is True:
-                msg = ("FactorModelOptimizer requires optimizer_config['model'] == 'Classic' "
-                       "and optimizer_config['hist'] == False\n"
-                       "FactorModelOptimizer precomputes factor covariance matrix (sigma).\n"
-                       "FactorModelOptimizer model=='Classic' is required to use precomputed sigma.")
-                raise ValueError(msg)
+        except KeyError as e:
+            raise ValueError(f"Error constructing factor exposure matrix: {e}")
 
-            # Check config keys
-            valid_objs = {"Sharpe", "MinRisk", "MaxRet", "Utility"}
-            obj = self._config.get("obj", "Sharpe")
-            if obj not in valid_objs:
-                raise ValueError(f"Invalid objective '{obj}'. Must be one of {valid_objs}.")
+        # Residual variance matrix D (diagonal)
+        try:
+            residual_var = end_df['residual_variance'].values
+            if np.any(residual_var <= 0):
+                raise ValueError("Residual variances must be positive")
+
+            self.D_ = pd.DataFrame(
+                np.diag(residual_var),
+                index=self.B_.index,
+                columns=self.B_.index,
+                dtype=np.float64
+            )
+        except Exception as e:
+            raise ValueError(f"Error constructing residual variance matrix: {e}")
+
+        # Construct factor returns
+        try:
+            mkt_factor_ret = (self.bw_daily_df_.groupby('date')['market_factor_return']
+                             .first().to_frame(name='Market'))
+
+            sector_data = (self.bw_daily_df_.groupby(['bw_sector_name', 'date'])
+                          ['sector_factor_return'].first().unstack(level=0))
+
+            factor_returns = pd.concat([mkt_factor_ret, sector_data], axis=1)
+            factor_returns = factor_returns.reindex(columns=self.B_.columns)
+
+            if factor_returns.isnull().any().any():
+                raise ValueError("Factor returns contain NaN values after alignment")
+
+        except Exception as e:
+            raise ValueError(f"Error constructing factor returns: {e}")
+
+        # Expected factor returns
+        try:
+            if self.method_f == 'ewma1':
+                self.f_ = (factor_returns.ewm(halflife=self.halflife, adjust=True)
+                          .mean().iloc[-1]
+                          .to_frame(name='f')
+                          )
+            elif self.method_f == 'ewma2':
+                self.f_ = (factor_returns.ewm(halflife=self.halflife, adjust=False)
+                          .mean().iloc[-1]
+                          .to_frame(name='f')
+                          )
+            elif self.method_f == 'hist':
+                self.f_ = factor_returns.mean(axis=0).to_frame(name='f')
+            else:
+                raise ValueError(f"Unknown method_f: {self.method_f}")
+
+            logger.info(f"Expected factor returns method: {self.method_f}")
+
+        except Exception as e:
+            raise ValueError(f"Error computing expected factor returns: {e}")
+
+        # Factor covariance matrix
+        try:
+            if self.method_F == 'ewma1':
+                ewm_cov = factor_returns.ewm(halflife=self.halflife, adjust=True).cov()
+                n_factors = factor_returns.shape[1]
+                self.F_ = ewm_cov.iloc[-n_factors:].copy()
+            elif self.method_F == 'ewma2':
+                ewm_cov = factor_returns.ewm(halflife=self.halflife, adjust=False).cov()
+                n_factors = factor_returns.shape[1]
+                self.F_ = ewm_cov.iloc[-n_factors:].copy()
+            elif self.method_F == 'hist':
+                self.F_ = factor_returns.cov()
+            else:
+                raise ValueError(f"Unknown method_F: {self.method_F}")
+
+            # Ensure positive definite
+            eigenvals = np.linalg.eigvals(self.F_.values)
+            if np.any(eigenvals <= 0):
+                logger.warning("Factor covariance matrix is not positive definite. "
+                              "Adding small regularization.")
+                self.F_ += np.eye(self.F_.shape[0]) * 1e-8
+
+            logger.info(f"Factor covariance method: {self.method_F}")
+
+        except Exception as e:
+            raise ValueError(f"Error computing factor covariance matrix: {e}")
+
+        # Expected asset returns μ = B @ f
+        try:
+            mu_vals = self.B_.values @ self.f_.values.flatten()
+            self.mu_ = pd.Series(mu_vals, index=self.B_.index, name='mu', dtype=np.float64)
+        except Exception as e:
+            raise ValueError(f"Error computing expected asset returns: {e}")
+
+        # Residual returns (for analysis)
+        try:
+            res_ret = self.bw_daily_df_['residual_return'].unstack(level='ticker')
+            res_ret = res_ret.reindex(columns=self.B_.index)
+
+            if self.method_f in ('ewma1', 'ewma2'):
+                if self.method_f == 'ewma1':
+                    self.mu_residual_ = res_ret.ewm(halflife=self.halflife, adjust=True).mean().iloc[-1]
+                else:
+                    self.mu_residual_ = res_ret.ewm(halflife=self.halflife, adjust=False).mean().iloc[-1]
+            elif self.method_f == 'hist':
+                self.mu_residual_ = res_ret.mean(axis=0)
+            else:
+                self.mu_residual_ = res_ret.mean(axis=0)
+
+        except Exception as e:
+            raise ValueError(f"Error computing residual returns: {e}")
+
+        # Asset covariance matrix Σ = B F B^T + D
+        try:
+            BFBt = self.B_.values @ self.F_.values @ self.B_.values.T
+            sigma_vals = BFBt + self.D_.values
+
+            self.sigma_ = pd.DataFrame(
+                sigma_vals,
+                index=self.B_.index,
+                columns=self.B_.index,
+                dtype=np.float64
+            )
+
+            # Ensure positive definite
+            eigenvals = np.linalg.eigvals(self.sigma_.values)
+            if np.any(eigenvals <= 0):
+                logger.warning("Asset covariance matrix is not positive definite. "
+                              "Adding small regularization.")
+                self.sigma_ += np.eye(self.sigma_.shape[0]) * 1e-8
+
+            logger.info(f"Asset covariance matrix Σ shape: {self.sigma_.shape}")
+
+        except Exception as e:
+            raise ValueError(f"Error computing asset covariance matrix: {e}")
+
+    def _predict_optimizer(self, X):
+        """
+        Factor model prediction: w^T * B * f
+        Can work with either factor returns directly or compute from asset returns.
+        """
+        if self.use_custom_inputs or self.B_ is None:
+            # Fall back to classic prediction if no factor structure
+            logger.info("Using classic prediction fallback for factor model")
+            predictions = self._predict_classic_fallback(X)
+
+        if isinstance(X, xr.Dataset):
+            # Try to get factor returns directly
+            factor_vars = ['market_factor_return', 'sector_factor_return']
+            if all(var in X.data_vars for var in factor_vars):
+                # Use factor returns directly
+                predictions = self._predict_from_factor_returns_xarray(X)
+            else:
+                # Fall back to asset-level prediction
+                predictions = self._predict_classic_fallback(X)
+
+        elif isinstance(X, pd.DataFrame):
+            # Check if X contains factor returns or asset returns
+            if self.B_ is not None and all(factor in X.columns for factor in self.B_.columns):
+                # X contains factor returns
+                predictions = self._predict_from_factor_returns_pandas(X)
+            else:
+                # Fall back to asset-level prediction
+                predictions = self._predict_classic_fallback(X)
 
         else:
-            # Set default config
-            self._config = {
-                "model": "Classic",          # Classic Markowitz optimizer
-                "rm": "MV",                  # Risk Measure: MV = Variance
-                "rf": 0,                     # Risk-free rate (in decimal form)
-                "l": 0,                      # Risk aversion (used in some models)
-                "method_f": "ewma",          # Method to estimate expected returns
-                "method_F": "ewma",          # Method to estimate covariance matrix
-                "halflife": 30,              # EWMA halflife in trading days
-                "hist": False,               # sigma & mu are computed from factor data
-                "obj": "Sharpe",             # Optimization objective
-                "sht": True,                 # Allow shorts
-                "budget": 1.0,               # Absolute sum of weights
-                "uppersht": 1.0,             # Maximum sum of absolute values of short
-                "upperlng": 1.0,             # Maximum of the sum of long
-                "returns_var": "return",     # Returns variable name: 'return' or 'residual_return'
-                "f_scalar": None             # Scalar applied to expected factor returns [0,1]
+            raise ValueError("X must be xr.Dataset or pd.DataFrame")
+
+        return predictions
+
+    def _predict_from_factor_returns_xarray(self, X):
+        """Predict from factor returns using xarray."""
+        # Get portfolio factor exposures: w^T * B
+        portfolio_exposures = (self.weights_.values.T @ self.B_.values).flatten()
+
+        # Construct factor returns array
+        market_ret = X['market_factor_return'] * 0.01
+        sector_rets = []
+
+        for sector in self.B_.columns[1:]:  # Skip 'Market'
+            if f'sector_factor_return_{sector}' in X.data_vars:
+                sector_rets.append(X[f'sector_factor_return_{sector}'] * 0.01)
+            else:
+                # Use generic sector return if specific sector not found
+                sector_rets.append(X['sector_factor_return'] * 0.01)
+
+        # Stack factor returns
+        factor_returns = xr.concat([market_ret] + sector_rets, dim='factor')
+        factor_returns = factor_returns.assign_coords(factor=self.B_.columns)
+
+        # Portfolio return: portfolio_exposures^T * factor_returns
+        exposures_da = xr.DataArray(portfolio_exposures, dims=['factor'],
+                                   coords={'factor': self.B_.columns})
+
+        predictions = xr.dot(exposures_da, factor_returns, dim='factor').values
+        return predictions
+
+    def _predict_from_factor_returns_pandas(self, X):
+        """Predict from factor returns using pandas DataFrame."""
+        # Get portfolio factor exposures: w^T * B
+        portfolio_exposures = (self.weights_.values.T @ self.B_.values).flatten()
+
+        # Align factor returns with portfolio exposures
+        factor_returns = X[self.B_.columns]
+
+        # Portfolio return: portfolio_exposures^T * factor_returns
+        predictions = (factor_returns.values @ portfolio_exposures).flatten()
+        return predictions
+
+    def _predict_classic_fallback(self, X):
+        """Fallback to classic asset-level prediction."""
+        if isinstance(X, xr.Dataset):
+            returns_var = getattr(self, 'returns_var', 'return')
+            returns = X[returns_var].sel(ticker=self.weights_.index) * 0.01
+
+            # Convert weights to xarray
+            w = self.get_weights()
+            w = xr.DataArray(w.values, dims=["ticker"], coords={"ticker": w.index})
+
+            predictions = xr.dot(returns, w, dim='ticker').values
+            return predictions
+
+        elif isinstance(X, pd.DataFrame):
+            aligned_returns = X.reindex(columns=self.weights_.index)
+            predictions = (aligned_returns @ self.weights_.values).values
+            return predictions
+
+    def get_factor_exposures(self):
+        """Get portfolio factor exposures."""
+        check_is_fitted(self)
+
+        # Only available if factor model was computed (not custom inputs)
+        if self.use_custom_inputs or self.B_ is None:
+            logger.warning("Factor exposures not available when using custom inputs")
+            return None
+
+        w = self.weights_.values.flatten()
+        factor_exposures = self.B_.values.T @ w
+
+        return pd.Series(
+            factor_exposures,
+            index=self.B_.columns,
+            name='portfolio_exposure'
+        )
+
+    def decompose_returns(self):
+        """Decompose expected returns into factor and residual components."""
+        check_is_fitted(self)
+
+        # Only available if factor model was computed (not custom inputs)
+        if self.use_custom_inputs or self.B_ is None or self.f_ is None:
+            logger.warning("Return decomposition not available when using custom inputs")
+            return {
+                'factor_contribution': None,
+                'residual_contribution': None,
+                'total_expected_return': self.port_return_,
+                'portfolio_expected_return': self.port_return_
             }
 
-        if self.input_config is None:
-            self.input_config = self._config.copy()
+        w = self.weights_.values.flatten()
 
-        returns_var = self._config.pop('returns_var')
-        returns = self.bw_daily_df[returns_var].unstack(level='ticker')
+        # Factor contribution
+        factor_returns = (self.B_.values @ self.f_.values.flatten())
+        factor_contrib = np.dot(factor_returns, w)
 
-        # Only used for number of assets and tickers
-        self.port = rp.Portfolio(returns=returns)
+        # Residual contribution
+        resid_contrib = np.dot(self.mu_residual_.values, w)
 
+        return {
+            'factor_contribution': factor_contrib,
+            'residual_contribution': resid_contrib,
+            'total_expected_return': factor_contrib + resid_contrib,
+            'portfolio_expected_return': self.port_return_
+        }
 
-    def compute_mu_sigma(self):
-        """
-        Compute the factor model covariance matrix Σ = B F Bᵀ + D,
-        where:
-            - B: factor exposure matrix (market + sector)
-            - F: factor covariance matrix
-            - D: diagonal matrix of residual variances
-        """
+    def get_portfolio_stats(self, active_threshold=0.001):
+        """Get extended portfolio statistics including factor exposures."""
+        stats = super().get_portfolio_stats(active_threshold=active_threshold)
 
-        # --- 1. Factor-level DataFrame retrieve exposures on final date ---
-        window_df = self.bw_daily_df
+        # Add factor-specific stats only if factor model was computed
+        if not self.use_custom_inputs and hasattr(self, 'B_') and self.B_ is not None:
+            stats['num_factors'] = self.B_.shape[1]
+            factor_exp = self.get_factor_exposures()
+            if factor_exp is not None:
+                stats['factor_exposures'] = factor_exp.to_dict()
 
-        end_df = self.bw_daily_df.xs(self.end_date, level='date')
-
-        # --- 2. Construct B matrix: Market and Sector exposures ---
-        market_beta = end_df[['market_beta']]  # shape: [n_assets x 1]
-        sector_dummies = pd.get_dummies(end_df['bw_sector_name'])  # [n_assets x k_sectors]
-        sector_beta = sector_dummies.mul(end_df['sector_beta'], axis=0)  # [n_assets x k]
-        self.B = pd.concat([market_beta, sector_beta], axis=1)  # [n_assets x (1 + k)]
-
-        # --- 3. Residual variance matrix D (diagonal) ---
-        self.D = pd.DataFrame(np.diag(end_df['residual_variance']),
-                              index=self.B.index,
-                              columns=self.B.index)
-
-        # --- 4. Expected factor returns matrix f: mean or EWM ---
-        mkt_factor_ret = window_df.groupby('date')['market_factor_return'].first().to_frame(name='Market')
-        sctr_factor_ret = window_df.groupby(['bw_sector_name', 'date'])['sector_factor_return'].first().unstack().T
-        factor_returns = pd.concat([mkt_factor_ret, sctr_factor_ret], axis=1)
-
-        method_f = self._config.pop('method_f', None)
-        halflife = self._config.pop('halflife', None)
-
-        if method_f == 'ewma':
-            self.f = factor_returns.ewm(halflife=halflife).mean().iloc[-1].to_frame(name='f')
-        elif method_f == 'hist':
-            self.f = factor_returns.mean(axis=0).to_frame(name='f')
+            # Add return decomposition
+            try:
+                decomp = self.decompose_returns()
+                stats.update(decomp)
+            except:
+                pass
         else:
-            warnings.warn("method_f not read; using simple mean as default.")
-            self.f = factor_returns.mean(axis=0).to_frame(name='f')
+            stats['using_custom_inputs'] = self.use_custom_inputs
 
-        # --- 5. Factor covariance matrix F ---
-        method_F = self._config.pop('method_F')
+        return stats
 
-        if method_F == 'ewma':
-            self.F = factor_returns.ewm(halflife=halflife).cov().iloc[-factor_returns.shape[1]:]  # last cov matrix
-        elif method_F == 'hist':
-            self.F = factor_returns.cov()
+
+class BlackLittermanOptimizer(BasePortfolioOptimizer):
+    """Scikit-learn compatible Black-Litterman optimizer.
+
+    The Black-Litterman model combines market equilibrium returns with
+    investor views to generate expected returns and optimal portfolios.
+
+    Parameters
+    ----------
+    method_mu : str, default='hist'
+        Method for market returns estimation
+    method_cov : str, default='hist'
+        Method for covariance estimation
+    ewma_mu_halflife : float, optional
+        EWMA halflife for returns
+    ewma_cov_halflife : float, optional
+        EWMA halflife for covariance
+    returns_var : str, default='return'
+        Column name for returns
+    rm : str, default='MV'
+        Risk measure
+    obj : str, default='Sharpe'
+        Optimization objective
+    rf : float, default=0.0
+        Risk-free rate
+    l : float, default=0.0
+        Risk aversion parameter
+    sht : bool, default=False
+        Allow short positions
+    budget : float, default=1.0
+        Total budget constraint
+    budgetsht : float, default=0.2
+        Short budget constraint
+    uppersht : float, default=0.2
+        Upper bound for short positions
+    upperlng : float, default=1.0
+        Upper bound for long positions
+    delta : float, optional
+        Risk aversion coefficient. If None, estimated from market cap weights
+    equilibrium : bool, default=True
+        Whether to use equilibrium returns as prior
+    P : pd.DataFrame, optional
+        Picking matrix for views (n_views x n_assets)
+    Q : pd.Series, optional
+        View portfolio expected returns (n_views,)
+    Omega : pd.DataFrame, optional
+        Uncertainty matrix for views (n_views x n_views)
+    tau : float, default=1.0
+        Scales the uncertainty of the prior
+    market_cap : pd.Series, optional
+        Market capitalizations for equilibrium calculation
+    """
+
+    def __init__(self,
+                 method_mu='hist',
+                 method_cov='hist',
+                 ewma_mu_halflife=None,
+                 ewma_cov_halflife=None,
+                 returns_var='return',
+                 rm='MV',
+                 obj='Sharpe',
+                 rf=0.0,
+                 l=0.0,
+                 sht=False,
+                 budget=1.0,
+                 budgetsht=0.2,
+                 uppersht=0.2,
+                 upperlng=1.0,
+                 delta=None,
+                 equilibrium=True,
+                 P=None,
+                 Q=None,
+                 Omega=None,
+                 tau=1.0,
+                 market_cap=None):
+
+        # Store all parameters as instance attributes
+        self.method_mu = method_mu
+        self.method_cov = method_cov
+        self.ewma_mu_halflife = ewma_mu_halflife
+        self.ewma_cov_halflife = ewma_cov_halflife
+        self.returns_var = returns_var
+        self.rm = rm
+        self.obj = obj
+        self.rf = rf
+        self.l = l
+        self.sht = sht
+        self.budget = budget
+        self.budgetsht = budgetsht
+        self.uppersht = uppersht
+        self.upperlng = upperlng
+        self.delta = delta
+        self.equilibrium = equilibrium
+        self.P = P
+        self.Q = Q
+        self.Omega = Omega
+        self.tau = tau
+        self.market_cap = market_cap
+
+        # Black-Litterman specific attributes
+        self._bl_attrs = ['Pi_', 'mu_bl_', 'sigma_bl_', 'w_eq_', 'delta_']
+
+        # Call parent constructor
+        super().__init__()
+        self._reset_fitted_attrs()
+
+    def _reset_fitted_attrs(self):
+        """Reset fitted attributes including BL-specific ones."""
+        super()._reset_fitted_attrs()
+        for attr in self._bl_attrs:
+            setattr(self, attr, None)
+
+    def _halflife_to_d(self, halflife):
+        """Convert halflife to decay parameter."""
+        return 2 ** (-1 / halflife)
+
+    def _validate_bl_inputs(self, n_assets):
+        """Validate Black-Litterman specific inputs."""
+        if self.P is not None:
+            if not isinstance(self.P, pd.DataFrame):
+                raise ValueError("P must be a pandas DataFrame")
+            if self.P.shape[1] != n_assets:
+                raise ValueError(f"P must have {n_assets} columns (one per asset)")
+
+        if self.Q is not None:
+            if not isinstance(self.Q, (pd.Series, np.ndarray)):
+                raise ValueError("Q must be a pandas Series or numpy array")
+            if self.P is not None and len(self.Q) != self.P.shape[0]:
+                raise ValueError("Q length must match number of rows in P")
+
+        if self.Omega is not None:
+            if not isinstance(self.Omega, pd.DataFrame):
+                raise ValueError("Omega must be a pandas DataFrame")
+            if self.P is not None:
+                n_views = self.P.shape[0]
+                if self.Omega.shape != (n_views, n_views):
+                    raise ValueError(f"Omega must be {n_views}x{n_views} matrix")
+
+        # Check that views are specified together
+        if any([self.P is not None, self.Q is not None, self.Omega is not None]):
+            if not all([self.P is not None, self.Q is not None]):
+                raise ValueError("P and Q must both be specified for views")
+
+    def _estimate_delta(self, returns, market_cap=None):
+        """Estimate risk aversion coefficient delta."""
+        if self.delta is not None:
+            return self.delta
+
+        if market_cap is not None:
+            # Use market cap weighted portfolio
+            w_market = market_cap / market_cap.sum()
+            market_ret = (returns @ w_market).mean()
+            market_var = (returns @ w_market).var()
+            delta_est = market_ret / market_var
         else:
-            warnings.warn("method_F not read; using simple covariance as default.")
-            self.F = factor_returns.cov()
+            # Use equal weighted portfolio as proxy
+            w_eq = pd.Series(1/len(returns.columns), index=returns.columns)
+            market_ret = (returns @ w_eq).mean()
+            market_var = (returns @ w_eq).var()
+            delta_est = market_ret / market_var
 
-        # --- 6. Expected returns μ = B @ f ---
+        return max(delta_est, 0.1)  # Ensure positive and reasonable
 
-        # Scaled f if not confident in estimate
-        f_scalar = self._config.pop('f_scalar', None)
-        if f_scalar is not None:
-            self.scaled_f = self.f * f_scalar
-            mu = self.B.values @ self.scaled_f.values
+    def _fit_optimizer(self):
+        """Fit the Black-Litterman optimizer."""
+        # Create returns matrix
+        returns = self.bw_daily_df_[self.returns_var].unstack(level='ticker')
+        n_assets = returns.shape[1]
+
+        # Validate BL inputs
+        self._validate_bl_inputs(n_assets)
+
+        # Create portfolio object for basic stats
+        self.port_ = rp.Portfolio(returns=returns)
+
+        # Prepare method parameters
+        dict_mu = {}
+        dict_cov = {}
+
+        # EWMA conversions if needed
+        if self.method_mu in ('ewma1', 'ewma2'):
+            if self.ewma_mu_halflife is not None:
+                dict_mu['d'] = self._halflife_to_d(self.ewma_mu_halflife)
+
+        if self.method_cov in ('ewma1', 'ewma2'):
+            if self.ewma_cov_halflife is not None:
+                dict_cov['d'] = self._halflife_to_d(self.ewma_cov_halflife)
+
+        # Calculate basic statistics
+        self.port_.assets_stats(method_mu=self.method_mu, method_cov=self.method_cov,
+                               dict_mu=dict_mu, dict_cov=dict_cov)
+
+        # Store basic statistics
+        sigma_hist = self.port_.cov.copy()
+        mu_hist = self.port_.mu.squeeze().copy()
+
+        # Estimate or use provided delta
+        market_cap = None
+        if self.market_cap is not None:
+            market_cap = self.market_cap.reindex(returns.columns)
+
+        self.delta_ = self._estimate_delta(returns, market_cap)
+
+        # Calculate equilibrium portfolio weights
+        if self.equilibrium and market_cap is not None:
+            # Use market cap weights as equilibrium
+            self.w_eq_ = market_cap / market_cap.sum()
         else:
-            mu = self.B.values @ self.f.values
+            # Use reverse optimization: w_eq = (1/delta) * Sigma^-1 * mu_hist
+            try:
+                sigma_inv = pd.DataFrame(
+                    np.linalg.inv(sigma_hist.values),
+                    index=sigma_hist.index,
+                    columns=sigma_hist.columns
+                )
+                self.w_eq_ = sigma_inv @ mu_hist / self.delta_
+                self.w_eq_ = self.w_eq_ / self.w_eq_.sum()  # Normalize to sum to 1
+            except np.linalg.LinAlgError:
+                # If covariance is not invertible, use equal weights
+                logger.warning("Covariance matrix not invertible, using equal weights")
+                self.w_eq_ = pd.Series(1/n_assets, index=returns.columns)
 
-        self.mu_ = pd.Series(mu.flatten(), index=self.B.index, dtype=np.float64)
+        # Calculate equilibrium returns: Pi = delta * Sigma * w_eq
+        self.Pi_ = self.delta_ * (sigma_hist @ self.w_eq_)
 
-        # --- 9. Covariance matrix Σ = B F Bᵗ + D ---
-        sigma_vals = self.B.values @ self.F.values @ self.B.values.T + self.D.values
-        self.sigma_ = pd.DataFrame(sigma_vals,
-                                  index=self.B.index,
-                                  columns=self.B.index,
-                                  dtype=np.float64
-                                  )
+        # Apply Black-Litterman if views are provided
+        if self.P is not None and self.Q is not None:
+            self._apply_black_litterman(sigma_hist)
+        else:
+            # No views, use equilibrium returns and historical covariance
+            self.mu_bl_ = self.Pi_.copy()
+            self.sigma_bl_ = sigma_hist.copy()
 
-    def fit(self):
-        """
-        Optimizes portfolio using computed mu and sigma from factor model.
-        """
+        # Store final statistics
+        self.mu_ = self.mu_bl_.copy()
+        self.mu_.index.name = 'ticker'
+        self.mu_.name = None
 
-        # Check for computed sigma, mu
-        if self.sigma_ is None:
-            self.compute_mu_sigma()
+        self.sigma_ = self.sigma_bl_.copy()
+        self.sigma_.index.name = 'ticker'
+        self.sigma_.columns.name = 'ticker'
 
-        # Assign factor sigma, mu
-        self.port.mu = self.mu_
-        self.port.cov = self.sigma_
+        # Assign to portfolio object for optimization
+        self.port_.mu = self.mu_
+        self.port_.cov = self.sigma_
 
-        # Assign portfolio leverage and short/long budget
-        self.port.sht = self._config.pop('sht', False)
-        self.port.budget = self._config.pop('budget', 1.0)
-        self.port.uppersht = self._config.pop('uppersht', 1.0)
-        self.port.upperlng = self._config.pop('upperlng', 1.0)
+        # Set portfolio constraints
+        self.port_.sht = self.sht
+        self.port_.budget = self.budget
+        self.port_.budgetsht = self.budgetsht
+        self.port_.uppersht = self.uppersht
+        self.port_.upperlng = self.upperlng
 
+        # Prepare optimization config
+        opt_config = {
+            'model': 'Classic',
+            'rm': self.rm,
+            'obj': self.obj,
+            'rf': self.rf,
+            'l': self.l,
+            'hist': False
+        }
 
         # Run optimization
-        self.weights_ = self.port.optimization(**self._config)
+        self.weights_ = self.port_.optimization(**opt_config)
 
-        # Reset optimizer_config to input
-        self._config = self.input_config
+        # Calculate derived statistics
+        self.gross_exposure_ = self.weights_.abs().sum()
+        self._calculate_in_sample_stats()
 
-        # Calculate portfolio in-sample Sharpe and volatility
-        self._calculate_in_sample_sharpe()
+    def _apply_black_litterman(self, sigma_hist):
+        """Apply Black-Litterman formula to combine prior and views."""
+        # Align P matrix with asset ordering
+        P = self.P.reindex(columns=sigma_hist.columns)
+
+        # Convert Q to numpy array if it's a Series
+        Q = np.array(self.Q).reshape(-1, 1)
+
+        # Default Omega if not provided (proportional to view portfolio variance)
+        if self.Omega is None:
+            omega_diag = np.diag(P.values @ sigma_hist.values @ P.values.T)
+            self.Omega = pd.DataFrame(
+                np.diag(omega_diag),
+                index=P.index,
+                columns=P.index
+            )
+
+        # Align Omega with P
+        Omega = self.Omega.reindex(index=P.index, columns=P.index)
+
+        # Black-Litterman formulas
+        try:
+            # tau * Sigma
+            tau_sigma = self.tau * sigma_hist.values
+
+            # Sigma^-1
+            sigma_inv = np.linalg.inv(sigma_hist.values)
+
+            # P^T * Omega^-1 * P
+            omega_inv = np.linalg.inv(Omega.values)
+            PtOmegaP = P.values.T @ omega_inv @ P.values
+
+            # P^T * Omega^-1 * Q
+            PtOmegaQ = P.values.T @ omega_inv @ Q.flatten()
+
+            # New covariance: Sigma_BL = [(tau*Sigma)^-1 + P^T*Omega^-1*P]^-1
+            M1_inv = np.linalg.inv(tau_sigma) + PtOmegaP
+            self.sigma_bl_ = pd.DataFrame(
+                np.linalg.inv(M1_inv),
+                index=sigma_hist.index,
+                columns=sigma_hist.columns
+            )
+
+            # New mean: mu_BL = Sigma_BL * [(tau*Sigma)^-1*Pi + P^T*Omega^-1*Q]
+            term1 = np.linalg.inv(tau_sigma) @ self.Pi_.values
+            term2 = PtOmegaQ
+            mu_bl_vals = self.sigma_bl_.values @ (term1 + term2)
+
+            self.mu_bl_ = pd.Series(
+                mu_bl_vals.flatten(),
+                index=sigma_hist.index,
+                name='mu_bl'
+            )
+
+            logger.info(f"Applied Black-Litterman with {P.shape[0]} views")
+
+        except np.linalg.LinAlgError as e:
+            logger.error(f"Black-Litterman calculation failed: {e}")
+            # Fall back to equilibrium
+            self.mu_bl_ = self.Pi_.copy()
+            self.sigma_bl_ = sigma_hist.copy()
+
+    def _predict_optimizer(self, X):
+        """
+        Black-Litterman prediction: w^T * r
+        Similar to classic optimizer but using BL-adjusted parameters.
+        """
+        if isinstance(X, xr.Dataset):
+            returns_var = getattr(self, 'returns_var', 'return')
+            returns = X[returns_var].sel(ticker=self.weights_.index) * 0.01
+
+            # Convert weights to xarray
+            w = self.get_weights()
+            w = xr.DataArray(
+                w.values,
+                dims=["ticker"],
+                coords={"ticker": w.index},
+            )
+
+            predictions = xr.dot(returns, w, dim='ticker').values
+            return predictions
+
+        elif isinstance(X, pd.DataFrame):
+            aligned_returns = X.reindex(columns=self.weights_.index)
+            predictions = (aligned_returns @ self.weights_.values).values
+            return predictions
+
+        else:
+            raise ValueError("X must be xr.Dataset or pd.DataFrame")
+
+    def get_bl_stats(self):
+        """Get Black-Litterman specific statistics."""
+        check_is_fitted(self)
+
+        stats = {
+            'delta': self.delta_,
+            'tau': self.tau,
+            'equilibrium_used': self.equilibrium,
+            'has_views': self.P is not None,
+            'equilibrium_portfolio_return': (self.w_eq_.T @ self.Pi_) if self.w_eq_ is not None else None,
+        }
+
+        if self.P is not None:
+            stats['num_views'] = self.P.shape[0]
+            stats['views_matrix_shape'] = self.P.shape
+
+        return stats
+
+    def get_portfolio_stats(self, active_threshold=0.001):
+        """Get extended portfolio statistics including BL-specific stats."""
+        stats = super().get_portfolio_stats(active_threshold=active_threshold)
+
+        # Add Black-Litterman specific stats
+        bl_stats = self.get_bl_stats()
+        stats.update(bl_stats)
+
+        return stats
+
+    def get_equilibrium_weights(self):
+        """Get equilibrium portfolio weights."""
+        check_is_fitted(self)
+        return self.w_eq_.copy() if self.w_eq_ is not None else None
+
+    def get_equilibrium_returns(self):
+        """Get equilibrium (implied) returns."""
+        check_is_fitted(self)
+        return self.Pi_.copy() if self.Pi_ is not None else None
 
 
-"""
-class BlackLittermanOptimizer(RiskfolioOptimizer):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+# Pipeline utilities and examples
+class PortfolioPipeline:
+    """Utility class for creating portfolio optimization pipelines."""
 
-        self.views = None  # investor views to blend with factor model
-        self.asset_classes = None
-        self.P = None
-        self.Q = None
+    @staticmethod
+    def create_classic_pipeline(**optimizer_params):
+        """Create a basic classic optimization pipeline."""
+        from sklearn.pipeline import Pipeline
 
-    def configure_optimizer(self):
-        pass
+        return Pipeline([
+            ('optimizer', ClassicOptimizer(**optimizer_params))
+        ])
 
-    def fit(self) -> None:
-        pass
-"""
+    @staticmethod
+    def create_factor_pipeline(**optimizer_params):
+        """Create a factor model optimization pipeline."""
+        from sklearn.pipeline import Pipeline
+
+        return Pipeline([
+            ('optimizer', FactorModelOptimizer(**optimizer_params))
+        ])
+
+    @staticmethod
+    def create_bl_pipeline(**optimizer_params):
+        """Create a Black-Litterman optimization pipeline."""
+        from sklearn.pipeline import Pipeline
+
+        return Pipeline([
+            ('optimizer', BlackLittermanOptimizer(**optimizer_params))
+        ])
+
+    @staticmethod
+    def create_ensemble_pipeline(optimizers_config):
+        """Create an ensemble of optimizers with different configurations."""
+        from sklearn.pipeline import Pipeline
+        from sklearn.ensemble import VotingRegressor
+
+        estimators = []
+        for name, (optimizer_class, params) in optimizers_config.items():
+            estimators.append((name, optimizer_class(**params)))
+
+        return Pipeline([
+            ('ensemble', VotingRegressor(estimators))
+        ])
+
+
+# Example usage functions
+def create_bl_views_example():
+    """Example function showing how to create Black-Litterman views."""
+
+    # Example: 3 assets, 2 views
+    assets = ['AAPL', 'MSFT', 'GOOGL']
+
+    # View 1: AAPL will outperform MSFT by 2%
+    # View 2: GOOGL will have absolute return of 8%
+    P = pd.DataFrame([
+        [1, -1, 0],    # AAPL - MSFT
+        [0, 0, 1]      # GOOGL
+    ], columns=assets, index=['View1', 'View2'])
+
+    Q = pd.Series([0.02, 0.08], index=['View1', 'View2'])
+
+    # Omega: uncertainty in views (higher = less confident)
+    Omega = pd.DataFrame([
+        [0.001, 0.0],
+        [0.0, 0.002]
+    ], index=['View1', 'View2'], columns=['View1', 'View2'])
+
+    return P, Q, Omega
