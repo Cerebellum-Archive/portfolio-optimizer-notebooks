@@ -428,6 +428,12 @@ class FactorModelOptimizer(BasePortfolioOptimizer):
         Custom covariance matrix
     use_custom_inputs : bool, default=False
         Whether to use custom mu/sigma instead of factor model computation
+    user_input_f : pd.Series, optional
+        Custom expected factor returns
+    user_input_F : pd.DataFrame, optional
+        Custom factor covariance matrix
+    use_custom_factor_inputs : bool, default=False
+        Whether to use custom f/F instead of factor model computation
     """
 
     def __init__(self,
@@ -446,7 +452,10 @@ class FactorModelOptimizer(BasePortfolioOptimizer):
                  upperlng=1.0,
                  user_input_mu=None,
                  user_input_cov=None,
-                 use_custom_inputs=False):
+                 use_custom_inputs=False,
+                 user_input_f=None,
+                 user_input_F=None,
+                 use_custom_factor_inputs=False):
 
         # Store all parameters as instance attributes (required for sklearn)
         self.method_f = method_f
@@ -465,6 +474,9 @@ class FactorModelOptimizer(BasePortfolioOptimizer):
         self.user_input_mu = user_input_mu
         self.user_input_cov = user_input_cov
         self.use_custom_inputs = use_custom_inputs
+        self.user_input_f = user_input_f
+        self.user_input_F = user_input_F
+        self.use_custom_factor_inputs = use_custom_factor_inputs
 
         # Factor model specific attributes
         self._factor_attrs = ['B_', 'F_', 'D_', 'f_', 'mu_residual_']
@@ -482,7 +494,7 @@ class FactorModelOptimizer(BasePortfolioOptimizer):
     def _validate_factor_data(self, df):
         """Validate factor model data requirements."""
         # Skip validation if using custom inputs
-        if self.use_custom_inputs:
+        if self.use_custom_inputs or self.use_custom_factor_inputs:
             return
 
         required_cols = [
@@ -495,10 +507,14 @@ class FactorModelOptimizer(BasePortfolioOptimizer):
         if missing_cols:
             raise ValueError(f"Missing required factor model columns: {missing_cols}")
 
-    def _validate_custom_inputs(self, returns):
+    def _validate_custom_mu_sigma_inputs(self, returns):
         """Validate custom mu and sigma inputs."""
         mu = self.user_input_mu
         sigma = self.user_input_cov
+
+        # Must provide at least one
+        if mu is None and sigma is None:
+            raise ValueError("At least one of user_input_mu or user_input_cov must be provided when use_custom_inputs=True")
 
         if mu is not None:
             mu = mu.sort_index()
@@ -519,15 +535,61 @@ class FactorModelOptimizer(BasePortfolioOptimizer):
             sigma = sigma.reindex(index=returns.columns, columns=returns.columns)
             self.user_input_cov = sigma
 
+    def _validate_custom_factor_inputs(self, B_matrix):
+        """Validate custom f and F inputs.
+
+        - f (expected factor returns) is optional, like mu.
+        - F (factor covariance) is optional, like sigma.
+        - At least one of them must be provided if use_custom_factor_inputs=True.
+        """
+        f = self.user_input_f
+        F = self.user_input_F
+
+        # Must provide at least one
+        if f is None and F is None:
+            raise ValueError("At least one of user_input_f or user_input_F must be provided when use_custom_factor_inputs=True")
+
+        # Validate f
+        if f is not None:
+            if not isinstance(f, (pd.Series, np.ndarray)):
+                raise ValueError("user_input_f must be a pandas Series or numpy array")
+            if isinstance(f, np.ndarray):
+                f = pd.Series(f.flatten(), index=B_matrix.columns)
+            else:
+                f = f.reindex(B_matrix.columns)
+            if f.shape[0] != B_matrix.shape[1]:
+                raise ValueError(f"user_input_f length {f.shape[0]} does not match number of factors {B_matrix.shape[1]}")
+            self.user_input_f = f
+
+        # Validate F
+        if F is not None:
+            if not isinstance(F, (pd.DataFrame, np.ndarray)):
+                raise ValueError("user_input_F must be a pandas DataFrame or numpy array")
+            if isinstance(F, np.ndarray):
+                F = pd.DataFrame(F, index=B_matrix.columns, columns=B_matrix.columns)
+            else:
+                F = F.reindex(index=B_matrix.columns, columns=B_matrix.columns)
+            if F.shape != (B_matrix.shape[1], B_matrix.shape[1]):
+                raise ValueError(f"user_input_F shape {F.shape} does not match number of factors")
+            self.user_input_F = F
+
+
     def _fit_optimizer(self):
         """Fit the Factor Model optimizer."""
         # Create basic portfolio object for optimization
         returns = self.bw_daily_df_[self.returns_var].unstack(level='ticker')
         self.port_ = rp.Portfolio(returns=returns)
 
+        # Construct factor exposure matrix B and residual variance D
+        # These are always derived from the input data X
+        self._construct_B_and_D()
+
         if self.use_custom_inputs:
-            # Use custom inputs instead of factor model computation
-            self._fit_with_custom_inputs(returns)
+            # Use custom mu/sigma inputs
+            self._fit_with_custom_mu_sigma_inputs(returns)
+        elif self.use_custom_factor_inputs:
+            # Use custom f/F inputs
+            self._fit_with_custom_factor_inputs()
         else:
             # Validate factor model data
             self._validate_factor_data(self.bw_daily_df_)
@@ -562,12 +624,12 @@ class FactorModelOptimizer(BasePortfolioOptimizer):
         self.gross_exposure_ = self.weights_.abs().sum()
         self._calculate_in_sample_stats()
 
-    def _fit_with_custom_inputs(self, returns):
+    def _fit_with_custom_mu_sigma_inputs(self, returns):
         """Fit optimizer using custom mu and sigma inputs."""
         logger.info("Using custom mu and sigma inputs instead of factor model computation...")
 
         # Validate custom inputs
-        self._validate_custom_inputs(returns)
+        self._validate_custom_mu_sigma_inputs(returns)
 
         # Check if both mu and sigma are provided
         if self.user_input_mu is None or self.user_input_cov is None:
@@ -596,10 +658,57 @@ class FactorModelOptimizer(BasePortfolioOptimizer):
         logger.info(f"Using custom mu with shape: {self.mu_.shape}")
         logger.info(f"Using custom sigma with shape: {self.sigma_.shape}")
 
-    def _compute_factor_model_stats(self):
-        """Compute factor model mu and sigma."""
-        logger.info("Computing factor model mu and sigma...")
+    def _fit_with_custom_factor_inputs(self):
+        """Fit optimizer using custom f and F inputs."""
+        logger.info("Using custom f and F inputs instead of computing them from data...")
 
+        # Validate custom f and F
+        self._validate_custom_factor_inputs(self.B_)
+
+        self.f_ = self.user_input_f.copy()
+        self.F_ = self.user_input_F.copy()
+
+        # Expected asset returns μ = B @ f
+        try:
+            mu_vals = self.B_.values @ self.f_.values.flatten()
+            self.mu_ = pd.Series(mu_vals, index=self.B_.index, name='mu', dtype=np.float64)
+        except Exception as e:
+            raise ValueError(f"Error computing expected asset returns from custom f: {e}")
+
+        # Asset covariance matrix Σ = B F B^T + D
+        try:
+            BFBt = self.B_.values @ self.F_.values @ self.B_.values.T
+            sigma_vals = BFBt + self.D_.values
+
+            self.sigma_ = pd.DataFrame(
+                sigma_vals,
+                index=self.B_.index,
+                columns=self.B_.index,
+                dtype=np.float64
+            )
+
+            # Ensure positive definite
+            eigenvals = np.linalg.eigvals(self.sigma_.values)
+            if np.any(eigenvals <= 0):
+                logger.warning("Asset covariance matrix (from custom F) is not positive definite. "
+                              "Adding small regularization.")
+                self.sigma_ += np.eye(self.sigma_.shape[0]) * 1e-8
+
+            logger.info(f"Asset covariance matrix Σ (from custom F) shape: {self.sigma_.shape}")
+
+        except Exception as e:
+            raise ValueError(f"Error computing asset covariance matrix from custom F: {e}")
+
+        # Set factor model attributes to None since we're not computing them
+        # (except B_ and D_ which are always derived from input data)
+        self.mu_residual_ = None # Residual returns are not directly computed with custom f/F
+
+        logger.info(f"Using custom f with shape: {self.f_.shape}")
+        logger.info(f"Using custom F with shape: {self.F_.shape}")
+
+    def _construct_B_and_D(self):
+        """Construct factor exposure matrix B and residual variance D from input data."""
+        logger.info("Constructing factor exposure matrix B and residual variance D...")
         # Get exposures from final date
         try:
             end_df = self.bw_daily_df_.xs(self.end_date_, level='date')
@@ -635,6 +744,11 @@ class FactorModelOptimizer(BasePortfolioOptimizer):
             )
         except Exception as e:
             raise ValueError(f"Error constructing residual variance matrix: {e}")
+        logger.info("B and D matrices constructed.")
+
+    def _compute_factor_model_stats(self):
+        """Compute factor model mu and sigma."""
+        logger.info("Computing factor model mu and sigma...")
 
         # Construct factor returns
         try:
@@ -760,28 +874,50 @@ class FactorModelOptimizer(BasePortfolioOptimizer):
             # Fall back to classic prediction if no factor structure
             logger.info("Using classic prediction fallback for factor model")
             predictions = self._predict_classic_fallback(X)
+        elif self.use_custom_factor_inputs:
+            # If custom f and F were provided, use them for prediction
+            # This assumes X contains the assets for which we want to predict returns
+            # and that B_ is already constructed from the training data.
+            # The prediction is w^T * (B * f_ + residual_returns)
+            # Since residual_returns are not available with custom f/F, we use B*f_
+            # This is a simplification, as a full prediction would require future residual returns.
+            # For now, we'll assume the prediction is based purely on factor returns.
+            if self.f_ is None:
+                raise ValueError("Custom factor returns (f_) not set for prediction.")
+            if self.B_ is None:
+                raise ValueError("Factor exposure matrix (B_) not set for prediction.")
 
-        if isinstance(X, xr.Dataset):
-            # Try to get factor returns directly
-            factor_vars = ['market_factor_return', 'sector_factor_return']
-            if all(var in X.data_vars for var in factor_vars):
-                # Use factor returns directly
-                predictions = self._predict_from_factor_returns_xarray(X)
-            else:
-                # Fall back to asset-level prediction
-                predictions = self._predict_classic_fallback(X)
+            # Portfolio factor exposures: w^T * B
+            portfolio_exposures = (self.weights_.values.T @ self.B_.values).flatten()
 
-        elif isinstance(X, pd.DataFrame):
-            # Check if X contains factor returns or asset returns
-            if self.B_ is not None and all(factor in X.columns for factor in self.B_.columns):
-                # X contains factor returns
-                predictions = self._predict_from_factor_returns_pandas(X)
-            else:
-                # Fall back to asset-level prediction
-                predictions = self._predict_classic_fallback(X)
-
+            # Predicted portfolio return = portfolio_exposures @ f_
+            predictions = (portfolio_exposures @ self.f_.values).flatten()
+            # If X is provided, we might want to align it, but for now, this is a simple prediction.
+            # This part might need refinement based on how prediction is expected to work with custom f/F.
+            # For now, it's a single predicted return based on the fitted f_.
+            return predictions
         else:
-            raise ValueError("X must be xr.Dataset or pd.DataFrame")
+            if isinstance(X, xr.Dataset):
+                # Try to get factor returns directly
+                factor_vars = ['market_factor_return', 'sector_factor_return']
+                if all(var in X.data_vars for var in factor_vars):
+                    # Use factor returns directly
+                    predictions = self._predict_from_factor_returns_xarray(X)
+                else:
+                    # Fall back to asset-level prediction
+                    predictions = self._predict_classic_fallback(X)
+
+            elif isinstance(X, pd.DataFrame):
+                # Check if X contains factor returns or asset returns
+                if self.B_ is not None and all(factor in X.columns for factor in self.B_.columns):
+                    # X contains factor returns
+                    predictions = self._predict_from_factor_returns_pandas(X)
+                else:
+                    # Fall back to asset-level prediction
+                    predictions = self._predict_classic_fallback(X)
+
+            else:
+                raise ValueError("X must be xr.Dataset or pd.DataFrame")
 
         return predictions
 
