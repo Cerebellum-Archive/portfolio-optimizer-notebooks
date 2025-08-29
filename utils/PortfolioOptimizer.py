@@ -493,9 +493,10 @@ class FactorModelOptimizer(BasePortfolioOptimizer):
 
     def _validate_factor_data(self, df):
         """Validate factor model data requirements."""
-        # Skip validation if using custom inputs
-        if self.use_custom_inputs or self.use_custom_factor_inputs:
-            return
+        if self.use_custom_inputs:
+            # Skip validation if using custom inputs for BOTH mu and sigma
+            if self.user_input_mu is not None and self.user_input_cov is not None:
+                return
 
         required_cols = [
             'market_beta', 'sector_beta', 'bw_sector_name',
@@ -517,22 +518,32 @@ class FactorModelOptimizer(BasePortfolioOptimizer):
             raise ValueError("At least one of user_input_mu or user_input_cov must be provided when use_custom_inputs=True")
 
         if mu is not None:
-            mu = mu.sort_index()
-            mu.index.name = "ticker"
-            if mu.shape[0] != returns.shape[1]:
-                raise ValueError(f"mu length {mu.shape[0]} does not match number of assets {returns.shape[1]}")
-            # Align with returns columns
-            mu = mu.reindex(returns.columns)
+            if not isinstance(mu, (pd.Series, np.ndarray)):
+                raise ValueError("user_input_mu must be a pandas Series or numpy array")
+            if isinstance(mu, np.ndarray):
+                mu = pd.Series(mu.flatten(), index=returns.columns)
+            else:
+                mu = mu.sort_index()
+                mu.index.name = "ticker"
+                if mu.shape[0] != returns.shape[1]:
+                    raise ValueError(f"mu length {mu.shape[0]} does not match number of assets {returns.shape[1]}")
+                # Align with returns columns
+                mu = mu.reindex(returns.columns)
             self.user_input_mu = mu
 
         if sigma is not None:
-            sigma = sigma.sort_index().sort_index(axis=1)
-            sigma.index.name = "ticker"
-            sigma.columns.name = "ticker"
-            if sigma.shape != (returns.shape[1], returns.shape[1]):
-                raise ValueError(f"Sigma shape {sigma.shape} does not match number of assets")
-            # Align with returns columns
-            sigma = sigma.reindex(index=returns.columns, columns=returns.columns)
+            if not isinstance(sigma, (pd.DataFrame, np.ndarray)):
+                raise ValueError("user_input_cov must be a pandas DataFrame or numpy array")
+            if isinstance(sigma, np.ndarray):
+                sigma = pd.DataFrame(sigma, index=returns.columns, columns=returns.columns)
+            else:
+                sigma = sigma.sort_index().sort_index(axis=1)
+                sigma.index.name = "ticker"
+                sigma.columns.name = "ticker"
+                if sigma.shape != (returns.shape[1], returns.shape[1]):
+                    raise ValueError(f"Sigma shape {sigma.shape} does not match number of assets")
+                # Align with returns columns
+                sigma = sigma.reindex(index=returns.columns, columns=returns.columns)
             self.user_input_cov = sigma
 
     def _validate_custom_factor_inputs(self, B_matrix):
@@ -580,9 +591,12 @@ class FactorModelOptimizer(BasePortfolioOptimizer):
         returns = self.bw_daily_df_[self.returns_var].unstack(level='ticker')
         self.port_ = rp.Portfolio(returns=returns)
 
-        # Construct factor exposure matrix B and residual variance D
-        # These are always derived from the input data X
-        self._construct_B_and_D()
+        # Construct factor exposure matrix B and residual variance D from input data X
+        # Only construct B and D if we need factor model computation
+        if not (self.use_custom_inputs and
+                self.user_input_mu is not None and
+                self.user_input_cov is not None):
+            self._construct_B_and_D()
 
         if self.use_custom_inputs:
             # Use custom mu/sigma inputs
@@ -625,55 +639,104 @@ class FactorModelOptimizer(BasePortfolioOptimizer):
         self._calculate_in_sample_stats()
 
     def _fit_with_custom_mu_sigma_inputs(self, returns):
-        """Fit optimizer using custom mu and sigma inputs."""
-        logger.info("Using custom mu and sigma inputs instead of factor model computation...")
+        """Fit optimizer using custom mu and/or sigma inputs."""
+        logger.info("Using custom mu and/or sigma inputs instead of factor model computation...")
 
         # Validate custom inputs
         self._validate_custom_mu_sigma_inputs(returns)
 
-        # Check if both mu and sigma are provided
-        if self.user_input_mu is None or self.user_input_cov is None:
-            raise ValueError("Both user_input_mu and user_input_cov must be provided when use_custom_inputs=True")
+        # Initialize with None
+        mu = None
+        sigma = None
 
-        # Use custom inputs directly
-        self.mu_ = self.user_input_mu.copy()
-        self.mu_.index.name = 'ticker'
-        self.mu_.name = None
+        # Handle custom mu
+        if self.user_input_mu is not None:
+            mu = self.user_input_mu.copy()
+            mu.index.name = 'ticker'
+            mu.name = None
+            logger.info(f"Using custom mu with shape: {mu.shape}")
 
-        self.sigma_ = self.user_input_cov.copy()
-        self.sigma_.index.name = 'ticker'
-        self.sigma_.columns.name = 'ticker'
+        # Handle custom sigma
+        if self.user_input_cov is not None:
+            sigma = self.user_input_cov.copy()
+            sigma.index.name = 'ticker'
+            sigma.columns.name = 'ticker'
 
-        # Ensure positive definite for sigma
-        eigenvals = np.linalg.eigvals(self.sigma_.values)
-        if np.any(eigenvals <= 0):
-            logger.warning("Custom covariance matrix is not positive definite. "
-                          "Adding small regularization.")
-            self.sigma_ += np.eye(self.sigma_.shape[0]) * 1e-8
+            # Ensure positive definite for sigma
+            eigenvals = np.linalg.eigvals(sigma.values)
+            if np.any(eigenvals <= 0):
+                logger.warning("Custom covariance matrix is not positive definite. "
+                              "Adding small regularization.")
+                sigma += np.eye(sigma.shape[0]) * 1e-8
 
-        # Set factor model attributes to None since we're not computing them
-        for attr in self._factor_attrs:
-            setattr(self, attr, None)
+            logger.info(f"Using custom sigma with shape: {sigma.shape}")
 
-        logger.info(f"Using custom mu with shape: {self.mu_.shape}")
-        logger.info(f"Using custom sigma with shape: {self.sigma_.shape}")
+        # Compute missing components using factor model
+        if mu is None or sigma is None:
+            # Compute mu or sigma from factor model
+            logger.info("Computing missing factor model stats from factor data.")
+            self._compute_factor_model_stats()  # This computes mu_, sigma_, f_, etc.
+
+        if sigma is not None:
+            # Assign portfolio sigma_ to user_input_cov
+            logger.info("Assigning portfolio sigma to user input sigma.")
+            self.sigma_ = sigma
+
+        if mu is not None:
+            # Assign portfolio sigma_ to user_input_cov
+            logger.info("Assigning portfolio mu to user input mu.")
+            self.mu_ = mu
+
+        logger.info(f"Final mu shape: {self.mu_.shape}, sigma shape: {self.sigma_.shape}")
 
     def _fit_with_custom_factor_inputs(self):
-        """Fit optimizer using custom f and F inputs."""
-        logger.info("Using custom f and F inputs instead of computing them from data...")
+        """Fit optimizer using custom f and/or F inputs with flexible combinations."""
+        logger.info("Using custom f and/or F inputs...")
 
         # Validate custom f and F
         self._validate_custom_factor_inputs(self.B_)
 
-        self.f_ = self.user_input_f.copy()
-        self.F_ = self.user_input_F.copy()
+        # Initialize with None
+        f = None
+        F = None
 
+        # Handle custom f
+        if self.user_input_f is not None:
+            f = self.user_input_f.copy()
+            logger.info(f"Using custom f with shape: {f.shape}")
+
+        # Handle custom F
+        if self.user_input_F is not None:
+            F = self.user_input_F.copy()
+            logger.info(f"Using custom F with shape: {F.shape}")
+
+        # Compute missing components from data
+        if f is None or F is None:
+            logger.info("Computing missing factor statistics from data")
+            self._compute_factor_model_stats()  # This computes both f_ and F_
+
+        # Use custom inputs where provided
+        if f is not None:
+            self.f_ = f
+        # self.f_ already set by _compute_factor_model_stats() if f is None
+
+        if F is not None:
+            self.F_ = F
+            # Ensure positive definite for F
+            eigenvals = np.linalg.eigvals(self.F_.values)
+            if np.any(eigenvals <= 0):
+                logger.warning("Custom factor covariance matrix is not positive definite. "
+                              "Adding small regularization.")
+                self.F_ += np.eye(self.F_.shape[0]) * 1e-8
+        # self.F_ already set by _compute_factor_model_stats() if F is None
+
+        # Now compute asset-level statistics using final f_ and F_
         # Expected asset returns μ = B @ f
         try:
             mu_vals = self.B_.values @ self.f_.values.flatten()
             self.mu_ = pd.Series(mu_vals, index=self.B_.index, name='mu', dtype=np.float64)
         except Exception as e:
-            raise ValueError(f"Error computing expected asset returns from custom f: {e}")
+            raise ValueError(f"Error computing expected asset returns: {e}")
 
         # Asset covariance matrix Σ = B F B^T + D
         try:
@@ -690,21 +753,24 @@ class FactorModelOptimizer(BasePortfolioOptimizer):
             # Ensure positive definite
             eigenvals = np.linalg.eigvals(self.sigma_.values)
             if np.any(eigenvals <= 0):
-                logger.warning("Asset covariance matrix (from custom F) is not positive definite. "
+                logger.warning("Asset covariance matrix is not positive definite. "
                               "Adding small regularization.")
                 self.sigma_ += np.eye(self.sigma_.shape[0]) * 1e-8
 
-            logger.info(f"Asset covariance matrix Σ (from custom F) shape: {self.sigma_.shape}")
+            logger.info(f"Final asset covariance matrix Σ shape: {self.sigma_.shape}")
 
         except Exception as e:
-            raise ValueError(f"Error computing asset covariance matrix from custom F: {e}")
+            raise ValueError(f"Error computing asset covariance matrix: {e}")
 
-        # Set factor model attributes to None since we're not computing them
-        # (except B_ and D_ which are always derived from input data)
-        self.mu_residual_ = None # Residual returns are not directly computed with custom f/F
+        # Handle residual returns (only if computed from data)
+        if f is None:
+            # self.mu_residual_ already computed in _compute_factor_model_stats()
+            pass
+        else:
+            # With custom f, residual returns aren't directly available
+            self.mu_residual_ = None
 
-        logger.info(f"Using custom f with shape: {self.f_.shape}")
-        logger.info(f"Using custom F with shape: {self.F_.shape}")
+        logger.info(f"Final mu shape: {self.mu_.shape}, sigma shape: {self.sigma_.shape}")
 
     def _construct_B_and_D(self):
         """Construct factor exposure matrix B and residual variance D from input data."""

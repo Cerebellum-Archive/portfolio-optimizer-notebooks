@@ -286,25 +286,64 @@ class TestFactorModelOptimizer(TestPortfolioOptimizerBase):
             self.assertIsNotNone(optimizer.f_)  # Factor returns
 
     def test_custom_inputs_mode(self):
-        """Test factor model with custom inputs."""
-        # Get reference data
+        """Test FactorModelOptimizer with various custom mu and sigma inputs."""
+        # 1. Get reference data by fitting a default FactorModelOptimizer
         ref_optimizer = FactorModelOptimizer()
         ref_optimizer.fit(self.ds_train)
+        mu_ref = ref_optimizer.mu_.copy()
+        sigma_ref = ref_optimizer.sigma_.copy()
 
-        mu_in = ref_optimizer.mu_.copy()
-        sigma_in = ref_optimizer.sigma_.copy()
-
-        optimizer = FactorModelOptimizer(
+        # 2. Test Case: Custom mu, factor-calculated sigma
+        mu_in_custom = mu_ref * 0.5  # Create a distinct custom mu
+        optimizer_custom_mu = FactorModelOptimizer(
             use_custom_inputs=True,
-            user_input_mu=mu_in,
-            user_input_cov=sigma_in
+            user_input_mu=mu_in_custom
         )
-        optimizer.fit(self.ds_train)
+        optimizer_custom_mu.fit(self.ds_train)
 
-        self.assertIsNotNone(optimizer.weights_)
-        self.assertTrue(optimizer.use_custom_inputs)
-        # Factor attributes should be None when using custom inputs
-        self.assertIsNone(optimizer.B_)
+        self.assertIsNotNone(optimizer_custom_mu.weights_)
+        # Assert that the custom mu was used
+        np.testing.assert_array_almost_equal(optimizer_custom_mu.mu_.values, mu_in_custom.values, decimal=6)
+        # Assert that sigma was calculated by the factor model and matches the reference
+        np.testing.assert_array_almost_equal(optimizer_custom_mu.sigma_.values, sigma_ref.values, decimal=6)
+        # Assert that factor attributes are present because sigma was calculated
+        self.assertIsNotNone(optimizer_custom_mu.B_)
+        self.assertIsNotNone(optimizer_custom_mu.F_)
+
+        # 3. Test Case: Factor-calculated mu, custom sigma
+        sigma_in_custom = sigma_ref * 1.2 # Create a distinct custom sigma
+        optimizer_custom_sigma = FactorModelOptimizer(
+            use_custom_inputs=True,
+            user_input_cov=sigma_in_custom
+        )
+        optimizer_custom_sigma.fit(self.ds_train)
+
+        self.assertIsNotNone(optimizer_custom_sigma.weights_)
+        # Assert that mu was calculated by the factor model and matches the reference
+        np.testing.assert_array_almost_equal(optimizer_custom_sigma.mu_.values, mu_ref.values, decimal=6)
+        # Assert that the custom sigma was used
+        np.testing.assert_array_almost_equal(optimizer_custom_sigma.sigma_.values, sigma_in_custom.values, decimal=6)
+        # Assert that factor attributes are present because mu was calculated
+        self.assertIsNotNone(optimizer_custom_sigma.B_)
+        self.assertIsNotNone(optimizer_custom_sigma.f_)
+
+        # 4. Test Case: Both mu and sigma are custom
+        optimizer_both_custom = FactorModelOptimizer(
+            use_custom_inputs=True,
+            user_input_mu=mu_in_custom,
+            user_input_cov=sigma_in_custom
+        )
+        optimizer_both_custom.fit(self.ds_train)
+
+        self.assertIsNotNone(optimizer_both_custom.weights_)
+        # Assert that custom mu and sigma were used
+        np.testing.assert_array_almost_equal(optimizer_both_custom.mu_.values, mu_in_custom.values, decimal=6)
+        np.testing.assert_array_almost_equal(optimizer_both_custom.sigma_.values, sigma_in_custom.values, decimal=6)
+        # Assert that factor attributes are None because both mu and sigma were provided
+        self.assertIsNone(optimizer_both_custom.B_)
+        self.assertIsNone(optimizer_both_custom.F_)
+        self.assertIsNone(optimizer_both_custom.f_)
+
 
     def test_custom_factor_inputs(self):
         """Test FactorModelOptimizer with user-supplied factor returns (f) and covariances (F)."""
