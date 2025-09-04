@@ -132,6 +132,7 @@ class EWMTransformer(BaseEstimator, TransformerMixin):
     """Exponential Weighted Moving Average transformer"""
     def __init__(self, halflife=3):
         self.halflife = halflife
+        self.output_as_dataframe = True
 
     def fit(self, X, y=None):
         return self
