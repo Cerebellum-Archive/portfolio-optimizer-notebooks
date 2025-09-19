@@ -192,9 +192,11 @@ class ClassicOptimizer(BasePortfolioOptimizer):
     Parameters
     ----------
     method_mu : str, default='hist'
-        Method for expected returns estimation
+        Method for expected returns estimation.
+        Accepted values: 'hist', 'ewma1', 'ewma2', 'custom'.
     method_cov : str, default='hist'
-        Method for covariance estimation
+        Method for covariance estimation.
+        Accepted values: 'hist', 'ewma1', 'ewma2', 'custom'.
     ewma_mu_halflife : float, optional
         EWMA halflife for returns
     ewma_cov_halflife : float, optional
@@ -202,9 +204,12 @@ class ClassicOptimizer(BasePortfolioOptimizer):
     returns_var : str, default='return'
         Column name for returns
     rm : str, default='MV'
-        Risk measure
-    obj : str, default='Sharpe'
-        Optimization objective
+        Risk measure.
+        Accepted values: 'MV', 'MAD', 'MSV', 'FLPM', 'SLPM', 'CVaR',
+        'EVaR', 'WR', 'MDD', 'ADD', 'CDaR', 'EDaR', 'UCI'.
+    obj : str, default='MinRisk'
+        Optimization objective.
+        Accepted values: 'MinRisk', 'Utility', 'Sharpe', 'MaxRet'.
     rf : float, default=0.0
         Risk-free rate
     l : float, default=0.0
@@ -232,7 +237,7 @@ class ClassicOptimizer(BasePortfolioOptimizer):
                  ewma_cov_halflife=None,
                  returns_var='return',
                  rm='MV',
-                 obj='Sharpe',
+                 obj='MinRisk',
                  rf=0.0,
                  l=0.0,
                  sht=False,
@@ -396,18 +401,21 @@ class FactorModelOptimizer(BasePortfolioOptimizer):
 
     Parameters
     ----------
-    method_f : str, default='ewma1'
+    method_f : str, default='hist'
         Method for factor return estimation
-    method_F : str, default='ewma1'
+    method_F : str, default='hist'
         Method for factor covariance estimation
     halflife : int, default=30
         EWMA halflife in days
     returns_var : str, default='return'
         Column name for returns
     rm : str, default='MV'
-        Risk measure
-    obj : str, default='Sharpe'
-        Optimization objective
+        Risk measure.
+        Accepted values: 'MV', 'MAD', 'MSV', 'FLPM', 'SLPM', 'CVaR',
+        'EVaR', 'WR', 'MDD', 'ADD', 'CDaR', 'EDaR', 'UCI'.
+    obj : str, default='MinRisk'
+        Optimization objective.
+        Accepted values: 'MinRisk', 'Utility', 'Sharpe', 'MaxRet'.
     rf : float, default=0.0
         Risk-free rate
     l : float, default=0.0
@@ -437,12 +445,12 @@ class FactorModelOptimizer(BasePortfolioOptimizer):
     """
 
     def __init__(self,
-                 method_f='ewma1',
-                 method_F='ewma1',
+                 method_f='hist',
+                 method_F='hist',
                  halflife=30,
                  returns_var='return',
                  rm='MV',
-                 obj='Sharpe',
+                 obj='MinRisk',
                  rf=0.0,
                  l=0.0,
                  sht=True,
@@ -828,7 +836,8 @@ class FactorModelOptimizer(BasePortfolioOptimizer):
             factor_returns = factor_returns.reindex(columns=self.B_.columns)
 
             if factor_returns.isnull().any().any():
-                raise ValueError("Factor returns contain NaN values after alignment")
+                logger.warning("Factor returns contain NaN values. Filling with 0.")
+                factor_returns = factor_returns.fillna(0)
 
         except Exception as e:
             raise ValueError(f"Error constructing factor returns: {e}")
@@ -1124,9 +1133,11 @@ class BlackLittermanOptimizer(BasePortfolioOptimizer):
     Parameters
     ----------
     method_mu : str, default='hist'
-        Method for market returns estimation
+        Method for market returns estimation.
+        Accepted values: 'hist', 'ewma1', 'ewma2'.
     method_cov : str, default='hist'
-        Method for covariance estimation
+        Method for covariance estimation.
+        Accepted values: 'hist', 'ewma1', 'ewma2'.
     ewma_mu_halflife : float, optional
         EWMA halflife for returns
     ewma_cov_halflife : float, optional
@@ -1134,9 +1145,12 @@ class BlackLittermanOptimizer(BasePortfolioOptimizer):
     returns_var : str, default='return'
         Column name for returns
     rm : str, default='MV'
-        Risk measure
-    obj : str, default='Sharpe'
-        Optimization objective
+        Risk measure.
+        Accepted values: 'MV', 'MAD', 'MSV', 'FLPM', 'SLPM', 'CVaR',
+        'EVaR', 'WR', 'MDD', 'ADD', 'CDaR', 'EDaR', 'UCI'.
+    obj : str, default='MinRisk'
+        Optimization objective.
+        Accepted values: 'MinRisk', 'Utility', 'Sharpe', 'MaxRet'.
     rf : float, default=0.0
         Risk-free rate
     l : float, default=0.0
@@ -1174,7 +1188,7 @@ class BlackLittermanOptimizer(BasePortfolioOptimizer):
                  ewma_cov_halflife=None,
                  returns_var='return',
                  rm='MV',
-                 obj='Sharpe',
+                 obj='MinRisk',
                  rf=0.0,
                  l=0.0,
                  sht=False,

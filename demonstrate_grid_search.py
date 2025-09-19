@@ -36,8 +36,8 @@ def main():
 
     # 2. Define the parameter grid for the optimizer's parameters
     param_grid = {
-        'method_mu': ['ewma1'],
-        'method_cov': ['ewma1'],
+        'method_mu': ['ewma1', 'ewma2'],
+        'method_cov': ['ewma1', 'ewma2'],
         'ewma_mu_halflife': [5, 10, 30],
         'ewma_cov_halflife': [5, 10, 30]
     }
