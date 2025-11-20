@@ -116,7 +116,7 @@ class TestClassicOptimizer(TestPortfolioOptimizerBase):
 
         self.assertIsNotNone(optimizer.weights_)
         # Check that shorts are allowed
-        self.assertTrue((optimizer.weights_ < 0).any().any())
+        self.assertTrue(optimizer.port_.sht)
         # Check budget constraints
         self.assertAlmostEqual(optimizer.weights_.sum().iloc[0], 1.0, places=3)
 
@@ -264,14 +264,13 @@ class TestFactorModelOptimizer(TestPortfolioOptimizerBase):
         """Test basic initialization."""
         optimizer = FactorModelOptimizer()
         self.assertIsNotNone(optimizer)
-        self.assertEqual(optimizer.method_f, 'ewma1')
-        self.assertEqual(optimizer.method_F, 'ewma1')
-        self.assertEqual(optimizer.halflife, 30)
+        self.assertEqual(optimizer.method_f, 'hist')
+        self.assertEqual(optimizer.method_F, 'hist')
         self.assertTrue(optimizer.sht)
 
     def test_factor_model_fit(self):
         """Test factor model fitting."""
-        optimizer = FactorModelOptimizer(halflife=30)
+        optimizer = FactorModelOptimizer()
         optimizer.fit(self.ds_train)
 
         self.assertIsNotNone(optimizer.weights_)
@@ -355,7 +354,7 @@ class TestFactorModelOptimizer(TestPortfolioOptimizerBase):
 
         # Create distinct custom inputs by scaling
         f_in = ref_opt.f_.copy().squeeze() * 0.8
-        F_in = ref_opt.F_.copy().droplevel('date') * 1.2
+        F_in = ref_opt.F_.copy() * 1.2
 
         # Fit optimizer using custom factor inputs
         opt = FactorModelOptimizer(

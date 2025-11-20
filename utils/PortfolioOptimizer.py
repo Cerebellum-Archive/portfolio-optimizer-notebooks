@@ -34,7 +34,7 @@ class BasePortfolioOptimizer(BaseEstimator, TransformerMixin, RegressorMixin):
             config[param] = getattr(self, param)
         return config
 
-    def _validate_input(self, X, y=None, require_targets=False):
+    def _validate_input(self, X, y=None):
         """
         Validate input data format.
 
@@ -192,14 +192,14 @@ class ClassicOptimizer(BasePortfolioOptimizer):
     Parameters
     ----------
     method_mu : str, default='hist'
-        Method for expected returns estimation.
+        Method for asset returns estimation.
         Accepted values: 'hist', 'ewma1', 'ewma2', 'custom'.
     method_cov : str, default='hist'
         Method for covariance estimation.
         Accepted values: 'hist', 'ewma1', 'ewma2', 'custom'.
-    ewma_mu_halflife : float, optional
+    ewma_mu_halflife : int, optional
         EWMA halflife for returns
-    ewma_cov_halflife : float, optional
+    ewma_cov_halflife : int, optional
         EWMA halflife for covariance
     returns_var : str, default='return'
         Column name for returns
@@ -403,10 +403,14 @@ class FactorModelOptimizer(BasePortfolioOptimizer):
     ----------
     method_f : str, default='hist'
         Method for factor return estimation
+        Accepted values: 'hist', 'ewma1', 'ewma2', 'custom'.
     method_F : str, default='hist'
         Method for factor covariance estimation
-    halflife : int, default=30
-        EWMA halflife in days
+        Accepted values: 'hist', 'ewma1', 'ewma2', 'custom'.
+    ewma_f_halflife : int, default=None
+        EWMA halflife for factor returns in days
+    ewma_F_halflife : int, default=None
+        EWMA halflife for factor covariance in days
     returns_var : str, default='return'
         Column name for returns
     rm : str, default='MV'
@@ -447,7 +451,8 @@ class FactorModelOptimizer(BasePortfolioOptimizer):
     def __init__(self,
                  method_f='hist',
                  method_F='hist',
-                 halflife=30,
+                 ewma_f_halflife=None,
+                 ewma_F_halflife=None,
                  returns_var='return',
                  rm='MV',
                  obj='MinRisk',
@@ -468,7 +473,8 @@ class FactorModelOptimizer(BasePortfolioOptimizer):
         # Store all parameters as instance attributes (required for sklearn)
         self.method_f = method_f
         self.method_F = method_F
-        self.halflife = halflife
+        self.ewma_f_halflife = ewma_f_halflife
+        self.ewma_F_halflife = ewma_F_halflife
         self.returns_var = returns_var
         self.rm = rm
         self.obj = obj
@@ -845,12 +851,12 @@ class FactorModelOptimizer(BasePortfolioOptimizer):
         # Expected factor returns
         try:
             if self.method_f == 'ewma1':
-                self.f_ = (factor_returns.ewm(halflife=self.halflife, adjust=True)
+                self.f_ = (factor_returns.ewm(halflife=self.ewma_f_halflife, adjust=True)
                           .mean().iloc[-1]
                           .to_frame(name='f')
                           )
             elif self.method_f == 'ewma2':
-                self.f_ = (factor_returns.ewm(halflife=self.halflife, adjust=False)
+                self.f_ = (factor_returns.ewm(halflife=self.ewma_f_halflife, adjust=False)
                           .mean().iloc[-1]
                           .to_frame(name='f')
                           )
@@ -867,11 +873,11 @@ class FactorModelOptimizer(BasePortfolioOptimizer):
         # Factor covariance matrix
         try:
             if self.method_F == 'ewma1':
-                ewm_cov = factor_returns.ewm(halflife=self.halflife, adjust=True).cov()
+                ewm_cov = factor_returns.ewm(halflife=self.ewma_F_halflife, adjust=True).cov()
                 n_factors = factor_returns.shape[1]
                 self.F_ = ewm_cov.iloc[-n_factors:].copy()
             elif self.method_F == 'ewma2':
-                ewm_cov = factor_returns.ewm(halflife=self.halflife, adjust=False).cov()
+                ewm_cov = factor_returns.ewm(halflife=self.ewma_F_halflife, adjust=False).cov()
                 n_factors = factor_returns.shape[1]
                 self.F_ = ewm_cov.iloc[-n_factors:].copy()
             elif self.method_F == 'hist':
